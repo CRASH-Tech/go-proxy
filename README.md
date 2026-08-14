@@ -7,11 +7,11 @@ per-protocol proxy.
 
 ```
   LAN devices          client VM                         server VPS                internet
- ┌───────────┐   ┌────────────────────┐          ┌────────────────────────┐    ┌──────────┐
+ ┌───────────┐   ┌──────────────────-──┐          ┌────────────────────────┐    ┌──────────┐
  │ phone/PC  │──▶│ tun0  goproxy client│═════════▶│ goproxy server  tun0   │──▶ │  8.8.8.8 │
  │ (default  │   │  (encrypt + obfusc.)│  TCP/TLS │ (decrypt, NAT to world)│    │  google  │
  │  route)   │◀──│                     │◀═════════│                        │◀── │   ...    │
- └───────────┘   └────────────────────┘  internet└────────────────────────┘    └──────────┘
+ └───────────┘   └───────────────────-─┘  internet└────────────────────────┘    └──────────┘
 ```
 
 **All runtime configuration comes from environment variables** — there are no
