@@ -172,7 +172,10 @@ common:
                                    loss/reorder; anti-replay windowed)
   GOPROXY_PRIVATE_KEY        this peer's X25519 private key (base64)   [required]
   GOPROXY_PSK                shared secret; must match the peer        (default: none)
-  GOPROXY_MTU                tunnel MTU               (default: 1380)
+  GOPROXY_MTU                tunnel (inner) MTU       (default: 1320)
+                             padding is bounded to it and the outer TCP MSS is
+                             clamped, so packets fit typical/tunneled paths.
+                             Lower it if you still see stalls on a small-MTU path.
   GOPROXY_IFNAME             TUN device name          (default: kernel-assigned)
   GOPROXY_OBFS_MAX_PAD       max random padding bytes per record (default: 255)
   GOPROXY_OBFS_COVER         send randomised cover traffic       (default: true)
@@ -204,6 +207,9 @@ client (goproxy client) -- one tunnel per server:
   GOPROXY_SERVER_<NAME>            server host:port (declares a server; >=1 required)
   GOPROXY_SERVER_<NAME>_PUBLIC_KEY server's X25519 public key (base64)   [required]
   GOPROXY_SERVER_<NAME>_ROUTES     CIDRs to send via this server (comma/space)
+  GOPROXY_SERVER_<NAME>_EXCLUDE    CIDRs to keep OFF the tunnel (via the original
+                                   gateway) -- e.g. your LAN, so the host stays
+                                   reachable when _DEFAULT routes everything
   GOPROXY_SERVER_<NAME>_DEFAULT    route ALL traffic via this server (only one)
   GOPROXY_SERVER_<NAME>_TRANSPORT  aead|tls|udp        (default: GOPROXY_TRANSPORT)
   GOPROXY_SERVER_<NAME>_PSK        override            (default: GOPROXY_PSK)

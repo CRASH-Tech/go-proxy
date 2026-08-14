@@ -17,6 +17,7 @@ import (
 	"goproxy/internal/netsetup"
 	"goproxy/internal/noise"
 	"goproxy/internal/protocol"
+	"goproxy/internal/sockopt"
 	"goproxy/internal/transport"
 	"goproxy/internal/tun"
 )
@@ -78,6 +79,7 @@ type tunnel struct {
 
 	dev        *tun.Device
 	configured bool
+	tunMTU     int
 	cleanup    *netsetup.Cleanup
 }
 
@@ -200,7 +202,8 @@ func (t *tunnel) connect() (noise.Tunnel, *protocol.ServerHello, net.IP, error) 
 	var conn net.Conn
 	var err error
 	if t.sc.Transport == "udp" {
-		conn, err = net.Dial("udp", t.sc.Address)
+		d := &net.Dialer{Timeout: 15 * time.Second, Control: sockopt.UDPControl}
+		conn, err = d.Dial("udp", t.sc.Address)
 	} else {
 		conn, err = t.tr.Dial(t.sc.Address)
 	}
@@ -242,23 +245,36 @@ func (t *tunnel) setup(hello *protocol.ServerHello, remoteIP net.IP) error {
 	if mtu == 0 {
 		mtu = t.mtu
 	}
+	t.tunMTU = mtu
 	cidr := fmt.Sprintf("%s/%d", hello.ClientIP, prefix)
 	if err := t.dev.Configure(cidr, mtu); err != nil {
 		return err
 	}
 
-	// Keep the encrypted tunnel connection itself off the tunnel. DefaultRoute
-	// reads the 0.0.0.0/0 default, which SetDefaultViaTunnel does not touch, so
-	// this stays correct even when another tunnel has taken the default.
-	if remoteIP != nil {
-		gw, iface, err := netsetup.DefaultRoute()
-		if err == nil {
-			if err := netsetup.PinServerRoute(t.cleanup, remoteIP.String(), gw, iface); err != nil {
-				log.Printf("[%s] warning: pin server route: %v", t.name, err)
-			}
-		} else {
-			log.Printf("[%s] warning: default route lookup: %v", t.name, err)
+	// Original default gateway. DefaultRoute reads the 0.0.0.0/0 default, which
+	// SetDefaultViaTunnel does not touch, so this stays correct even when another
+	// tunnel has taken the default.
+	gw, iface, gwErr := netsetup.DefaultRoute()
+	if gwErr != nil && (remoteIP != nil || len(t.sc.Exclude) > 0) {
+		log.Printf("[%s] warning: default route lookup: %v", t.name, gwErr)
+	}
+
+	// Keep the encrypted tunnel connection itself off the tunnel.
+	if remoteIP != nil && gwErr == nil {
+		if err := netsetup.PinServerRoute(t.cleanup, remoteIP.String(), gw, iface); err != nil {
+			log.Printf("[%s] warning: pin server route: %v", t.name, err)
 		}
+	}
+
+	// Exclude networks (e.g. the LAN) from the tunnel by routing them via the
+	// original gateway — more specific than the tunnel's /1 default, so both
+	// outbound traffic and replies to inbound connections bypass the tunnel.
+	if len(t.sc.Exclude) > 0 && gwErr == nil {
+		if err := netsetup.AddRoutes(t.cleanup, t.sc.Exclude, gw, iface); err != nil {
+			return fmt.Errorf("exclude routes: %w", err)
+		}
+		log.Printf("[%s] excluded %d prefix(es) from tunnel via %s dev %s",
+			t.name, len(t.sc.Exclude), gw, iface)
 	}
 
 	if t.sc.Gateway {
@@ -287,6 +303,7 @@ func (t *tunnel) setup(hello *protocol.ServerHello, remoteIP net.IP) error {
 func (t *tunnel) runSession(sess noise.Tunnel, outCh <-chan []byte, stop <-chan struct{}) {
 	defer sess.Close()
 	sess.SetMaxPad(t.obfsMaxPad)
+	sess.SetMaxPayload(t.tunMTU)
 
 	var once sync.Once
 	done := make(chan struct{})

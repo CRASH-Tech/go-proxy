@@ -143,6 +143,11 @@ configures its TUN automatically. Per-server routing:
   this server (at most one server may set it).
 - `GOPROXY_SERVER_<NAME>_ROUTES="203.0.113.0/24 8.8.8.8/32"` — **split tunnel**:
   send only these prefixes through this server.
+- `GOPROXY_SERVER_<NAME>_EXCLUDE="192.168.0.0/16 10.0.0.0/8"` — keep these
+  networks **off** the tunnel (routed via the original gateway). Use it with
+  `_DEFAULT` so the client stays reachable from your LAN: a full-tunnel default
+  otherwise sends replies to other subnets into the tunnel. The client's own
+  connected subnet already bypasses the tunnel; add the ranges you reach it from.
 - `GOPROXY_SERVER_<NAME>_GATEWAY=true` — make the VM a router for **other
   devices**: traffic forwarded out of this TUN is masqueraded to the tunnel IP
   (for the "point my home router at the VM" setup).
@@ -351,8 +356,12 @@ Use real certificates and a strong PSK for anything important.
 
 ## Notes & limitations
 
+- **MTU is handled automatically.** The inner MTU defaults to 1320, per-packet
+  padding is bounded so wrapped packets never exceed it, and the outer TCP MSS is
+  clamped (1360) — so pages don't "load halfway" on reduced or tunneled paths.
+  If a very small-MTU path still stalls, lower `GOPROXY_MTU` on the server.
 - `aead` runs over TCP, so a lossy path incurs TCP-over-TCP behaviour. For most
-  browsing this is fine; `tls` has the same property.
+  browsing this is fine; `tls` has the same property. `udp` avoids it.
 - IPv6 packets are carried, but the NAT/route helpers configure IPv4.
 - Multi-hop (client → S1 → S2 → world) is not implemented yet; the transport and
   session layers are structured to allow chaining later.

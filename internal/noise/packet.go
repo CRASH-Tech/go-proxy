@@ -28,6 +28,7 @@ type Tunnel interface {
 	WriteJunk(maxSize int) error
 	RunCover(maxInterval time.Duration, maxJunk int, stop <-chan struct{})
 	SetMaxPad(n int)
+	SetMaxPayload(n int)
 	Close() error
 }
 
@@ -51,8 +52,9 @@ type PacketSession struct {
 	sendMu  sync.Mutex
 	sendCtr uint64
 
-	replay replayFilter
-	MaxPad int
+	replay     replayFilter
+	MaxPad     int
+	MaxPayload int
 
 	send func([]byte) error // transmit one datagram
 
@@ -67,6 +69,10 @@ func newPacketSession(sendKey, recvKey [keySize]byte, send func([]byte) error, r
 
 // SetMaxPad sets the maximum random padding per datagram.
 func (p *PacketSession) SetMaxPad(n int) { p.MaxPad = n }
+
+// SetMaxPayload bounds the plaintext per datagram so the wrapped UDP packet
+// stays within the path MTU (avoids fragmentation / drops).
+func (p *PacketSession) SetMaxPayload(n int) { p.MaxPayload = n }
 
 func (p *PacketSession) maxPad() int {
 	if p.MaxPad <= 0 {
@@ -90,7 +96,7 @@ func (p *PacketSession) sealAndSend(payload []byte) error {
 
 // WritePacket sends a single IP packet with random padding.
 func (p *PacketSession) WritePacket(pkt []byte) error {
-	pad := randPad(p.maxPad())
+	pad := randPad(padLimit(p.maxPad(), p.MaxPayload, len(pkt)))
 	payload := make([]byte, 0, len(pkt)+len(pad))
 	payload = append(payload, pkt...)
 	payload = append(payload, pad...)

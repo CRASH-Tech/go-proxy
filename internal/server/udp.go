@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"log"
 	"net"
 	"sync/atomic"
@@ -10,6 +11,7 @@ import (
 	"goproxy/internal/keys"
 	"goproxy/internal/noise"
 	"goproxy/internal/protocol"
+	"goproxy/internal/sockopt"
 )
 
 // minHandshakeMsg is the smallest possible message-1 (e + encStatic + empty
@@ -42,14 +44,12 @@ func (u *udpClient) allows(ip net.IP) bool {
 // runUDP serves the datagram (UDP) transport: a single socket that demuxes
 // datagrams by source address to per-client datagram sessions.
 func (s *Server) runUDP() error {
-	addr, err := net.ResolveUDPAddr("udp", s.cfg.Listen)
+	lc := net.ListenConfig{Control: sockopt.UDPControl}
+	packetConn, err := lc.ListenPacket(context.Background(), "udp", s.cfg.Listen)
 	if err != nil {
 		return err
 	}
-	pc, err := net.ListenUDP("udp", addr)
-	if err != nil {
-		return err
-	}
+	pc := packetConn.(*net.UDPConn)
 	s.udp = pc
 	defer pc.Close()
 	log.Printf("listening on %s (udp)", s.cfg.Listen)
@@ -126,6 +126,7 @@ func (s *Server) handleUDPHandshake(addr *net.UDPAddr, msg1 []byte) {
 		return
 	}
 	ps.SetMaxPad(s.cfg.ObfsMaxPad)
+	ps.SetMaxPayload(s.cfg.MTU)
 
 	name := matched.entry.Name
 	if name == "" {

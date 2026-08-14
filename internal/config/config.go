@@ -79,6 +79,7 @@ type ServerConn struct {
 	PSK             string
 	TLS             TLSClientConfig
 	Routes          []string // CIDRs to route through this server (split tunnel)
+	Exclude         []string // CIDRs to keep OFF the tunnel (via the original gateway)
 	SetDefaultRoute bool     // route all traffic through this server
 	Gateway         bool     // masquerade forwarded LAN traffic into this tunnel
 	InterfaceName   string   // TUN device name
@@ -205,7 +206,7 @@ func LoadServer() (*ServerConfig, error) {
 			Subnet:   env("GOPROXY_TUNNEL_SUBNET", "10.8.0.0/24"),
 			ServerIP: env("GOPROXY_TUNNEL_SERVER_IP", "10.8.0.1"),
 		},
-		MTU: envInt("GOPROXY_MTU", 1380),
+		MTU: envInt("GOPROXY_MTU", 1320),
 		TLS: TLSServerConfig{
 			Cert: env("GOPROXY_TLS_CERT", ""),
 			Key:  env("GOPROXY_TLS_KEY", ""),
@@ -265,7 +266,7 @@ func serverNames() []string {
 // GOPROXY_* defaults.
 func LoadClient() (*ClientConfig, error) {
 	c := &ClientConfig{
-		MTU:        envInt("GOPROXY_MTU", 1380),
+		MTU:        envInt("GOPROXY_MTU", 1320),
 		ObfsMaxPad: envInt("GOPROXY_OBFS_MAX_PAD", 255),
 		ObfsCover:  envBool("GOPROXY_OBFS_COVER", true),
 	}
@@ -291,6 +292,7 @@ func LoadClient() (*ClientConfig, error) {
 				Insecure: envBool(base+"_INSECURE", gInsecure),
 			},
 			Routes:          splitList(env(base+"_ROUTES", "")),
+			Exclude:         splitList(env(base+"_EXCLUDE", "")),
 			SetDefaultRoute: envBool(base+"_DEFAULT", false),
 			Gateway:         envBool(base+"_GATEWAY", gGateway),
 			InterfaceName:   env(base+"_IFNAME", ""),
@@ -377,6 +379,11 @@ func (c *ClientConfig) validate() error {
 		for _, cidr := range s.Routes {
 			if _, _, err := net.ParseCIDR(cidr); err != nil {
 				return fmt.Errorf("server %q route %q: %w", s.Name, cidr, err)
+			}
+		}
+		for _, cidr := range s.Exclude {
+			if _, _, err := net.ParseCIDR(cidr); err != nil {
+				return fmt.Errorf("server %q exclude %q: %w", s.Name, cidr, err)
 			}
 		}
 		if s.SetDefaultRoute {

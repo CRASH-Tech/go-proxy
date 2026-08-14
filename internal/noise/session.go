@@ -23,6 +23,10 @@ const maxRecord = 65535
 // to defeat packet-size fingerprinting.
 const DefaultMaxPad = 255
 
+// SafeMaxPayload is the fallback payload budget when none is negotiated. Chosen
+// so that even over UDP the outer packet stays within a conservative path MTU.
+const SafeMaxPayload = 1280
+
 // Session is an established, encrypted record channel over a net.Conn. Records
 // carry raw IP packets. Lengths are themselves encrypted so an observer sees
 // only an opaque byte stream.
@@ -33,7 +37,8 @@ type Session struct {
 	send   *cipherState
 	recv   *cipherState
 
-	MaxPad int
+	MaxPad     int
+	MaxPayload int // max plaintext bytes per record (inner packet + padding)
 
 	// RemoteStatic is the peer's static public key (identity).
 	RemoteStatic keys.PublicKey
@@ -50,6 +55,27 @@ func (s *Session) maxPad() int {
 		return DefaultMaxPad
 	}
 	return s.MaxPad
+}
+
+// SetMaxPayload sets the maximum plaintext bytes per record. Padding is bounded
+// so the wrapped packet never exceeds this, preventing tunnel-induced
+// fragmentation / MTU black holes.
+func (s *Session) SetMaxPayload(n int) { s.MaxPayload = n }
+
+// padLimit returns how many padding bytes may be added to a packet of pktLen
+// without pushing the record over the payload budget.
+func padLimit(maxPad, maxPayload, pktLen int) int {
+	if maxPayload <= 0 {
+		maxPayload = SafeMaxPayload
+	}
+	h := maxPayload - pktLen
+	if h < 0 {
+		h = 0
+	}
+	if h > maxPad {
+		h = maxPad
+	}
+	return h
 }
 
 // writeRecord encrypts and writes one plaintext payload as two AEAD records
@@ -82,11 +108,7 @@ func (s *Session) writeRecord(payload []byte) error {
 
 // WritePacket sends a single IP packet through the tunnel, with random padding.
 func (s *Session) WritePacket(pkt []byte) error {
-	pad := randPad(s.maxPad())
-	// Ensure we do not exceed the record limit after padding.
-	if len(pkt)+len(pad) > maxRecord {
-		pad = pad[:maxRecord-len(pkt)]
-	}
+	pad := randPad(padLimit(s.maxPad(), s.MaxPayload, len(pkt)))
 	payload := make([]byte, 0, len(pkt)+len(pad))
 	payload = append(payload, pkt...)
 	payload = append(payload, pad...)

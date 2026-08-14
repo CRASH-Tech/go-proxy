@@ -12,10 +12,13 @@
 package transport
 
 import (
+	"context"
 	"crypto/tls"
 	"fmt"
 	"net"
 	"time"
+
+	"goproxy/internal/sockopt"
 )
 
 // Transport dials or listens for the outer connection.
@@ -40,7 +43,8 @@ type tcpTransport struct{}
 func NewTCP() Transport { return tcpTransport{} }
 
 func (tcpTransport) Dial(addr string) (net.Conn, error) {
-	c, err := net.DialTimeout("tcp", addr, 15*time.Second)
+	d := &net.Dialer{Timeout: 15 * time.Second, Control: sockopt.TCPControl}
+	c, err := d.Dial("tcp", addr)
 	if err != nil {
 		return nil, err
 	}
@@ -49,7 +53,8 @@ func (tcpTransport) Dial(addr string) (net.Conn, error) {
 }
 
 func (tcpTransport) Listen(addr string) (net.Listener, error) {
-	return net.Listen("tcp", addr)
+	lc := net.ListenConfig{Control: sockopt.TCPControl}
+	return lc.Listen(context.Background(), "tcp", addr)
 }
 
 // --- tls ---
@@ -72,7 +77,7 @@ func NewTLSClient(sni string, insecure bool) Transport {
 }
 
 func (t tlsClientTransport) Dial(addr string) (net.Conn, error) {
-	d := &net.Dialer{Timeout: 15 * time.Second}
+	d := &net.Dialer{Timeout: 15 * time.Second, Control: sockopt.TCPControl}
 	c, err := tls.DialWithDialer(d, "tcp", addr, t.cfg)
 	if err != nil {
 		return nil, err
@@ -104,5 +109,10 @@ func (tlsServerTransport) Dial(addr string) (net.Conn, error) {
 }
 
 func (t tlsServerTransport) Listen(addr string) (net.Listener, error) {
-	return tls.Listen("tcp", addr, t.cfg)
+	lc := net.ListenConfig{Control: sockopt.TCPControl}
+	ln, err := lc.Listen(context.Background(), "tcp", addr)
+	if err != nil {
+		return nil, err
+	}
+	return tls.NewListener(ln, t.cfg), nil
 }

@@ -261,6 +261,7 @@ func (s *Server) handleConn(conn net.Conn) {
 	}
 	cc := &clientConn{sess: sess, name: name, ip: matched.ip, allowed: matched.allowed}
 	sess.MaxPad = s.cfg.ObfsMaxPad
+	sess.SetMaxPayload(s.cfg.MTU)
 
 	// Symmetric cover traffic from the server side.
 	if s.cfg.ObfsCover {
