@@ -1,0 +1,5 @@
+.git
+/goproxy
+*.key
+*.pem
+deploy/*.env

@@ -1,0 +1,45 @@
+# Client: relays traffic through the encrypted tunnel to the server.
+#
+#   cd deploy
+#   cp client.env.example client.env   # then edit server/keys/psk
+#   docker compose -f docker-compose.client.yml up -d --build
+#
+# In the default (bridge) setup the client tunnels its OWN network namespace:
+# with GOPROXY_SET_DEFAULT_ROUTE=true the container's traffic goes through the
+# tunnel. Other containers can share that namespace to be tunnelled too — see
+# the commented "app" service below.
+#
+services:
+  goproxy-client:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    image: goproxy:latest
+    container_name: goproxy-client
+    restart: unless-stopped
+    command: ["client"]
+    env_file:
+      - client.env
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    # Only needed when GOPROXY_GATEWAY=true (forwarding other hosts' traffic).
+    sysctls:
+      net.ipv4.ip_forward: "1"
+
+  # --- Route another container through the tunnel ---
+  # It shares the client's network namespace, so all its traffic follows the
+  # client's routes. Uncomment to use.
+  # app:
+  #   image: curlimages/curl:latest
+  #   depends_on: [goproxy-client]
+  #   network_mode: "service:goproxy-client"
+  #   command: ["sh", "-c", "sleep infinity"]
+
+# --- Alternative: gateway for the whole LAN (router points at this host) ---
+# Use host networking so the TUN, routes and MASQUERADE apply to the host
+# network namespace, and set GOPROXY_GATEWAY=true in client.env. Replace the
+# service definition's networking with:
+#   network_mode: host
+# (keep cap_add, devices, sysctls; env_file still applies).

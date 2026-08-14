@@ -1,0 +1,37 @@
+# Server: terminates client tunnels and NATs their traffic to the internet.
+#
+#   cd deploy
+#   cp server.env.example server.env   # then edit keys/psk/clients
+#   docker compose -f docker-compose.server.yml up -d --build
+#
+services:
+  goproxy-server:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    image: goproxy:latest
+    container_name: goproxy-server
+    restart: unless-stopped
+    command: ["server"]
+    env_file:
+      - server.env
+    # Required to create the TUN device and manage iptables/routes.
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    # IP forwarding in the container's own network namespace (namespaced sysctl).
+    sysctls:
+      net.ipv4.ip_forward: "1"
+    # Expose the listen port. Must match GOPROXY_LISTEN in server.env.
+    ports:
+      - "443:443"
+    # The server MASQUERADEs client traffic out of its default interface (eth0
+    # on the docker bridge), so outbound goes bridge -> host -> internet.
+
+    # --- Alternative: host networking (for a dedicated VPS) ---
+    # Listen on the host IP directly and NAT via the real host interface.
+    # Replace the bridge/ports/sysctls block above with:
+    #   network_mode: host
+    # and ensure the host has net.ipv4.ip_forward=1
+    # (sysctl -w net.ipv4.ip_forward=1). Keep cap_add and devices.

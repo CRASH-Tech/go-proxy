@@ -1,0 +1,4 @@
+/dev
+/goproxy
+*.key
+*.pem
