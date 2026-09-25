@@ -215,3 +215,60 @@ func TestReject6(t *testing.T) {
 		t.Fatal("rejected a multicast packet")
 	}
 }
+
+// syn builds a TCP SYN (flags) with the given options and a valid checksum.
+func syn(flags byte, opts []byte) []byte {
+	l4 := make([]byte, 20+len(opts))
+	binary.BigEndian.PutUint16(l4[0:], 40000)
+	binary.BigEndian.PutUint16(l4[2:], 443)
+	l4[12] = byte((20+len(opts))/4) << 4
+	l4[13] = flags
+	copy(l4[20:], opts)
+	return ipv4(protoTCP, tunIP, remote, l4)
+}
+
+func mssOf(pkt []byte) uint16 {
+	opts := pkt[40 : 20+int(pkt[32]>>4)*4]
+	for i := 0; i+3 < len(opts); {
+		if opts[i] == 1 {
+			i++
+			continue
+		}
+		if opts[i] == 2 {
+			return binary.BigEndian.Uint16(opts[i+2:])
+		}
+		i += int(opts[i+1])
+	}
+	return 0
+}
+
+func TestClampMSS(t *testing.T) {
+	linuxSYN := []byte{2, 4, 0x05, 0xb4, 4, 2, 8, 10, 0, 0, 0, 1, 0, 0, 0, 0, 1, 3, 3, 7} // mss 1460, sackOK, TS, wscale
+	nopFirst := []byte{1, 1, 8, 10, 0, 0, 0, 1, 0, 0, 0, 0, 2, 4, 0x05, 0x84}             // TS before mss 1412
+	for name, pkt := range map[string][]byte{
+		"syn":            syn(0x02, linuxSYN),
+		"syn-ack":        syn(0x12, linuxSYN),
+		"mss after opts": syn(0x02, nopFirst),
+	} {
+		if !ClampMSS(pkt, 1280) {
+			t.Fatalf("%s: not clamped", name)
+		}
+		verify4(t, pkt)
+		if got := mssOf(pkt); got != 1280 {
+			t.Fatalf("%s: mss %d, want 1280", name, got)
+		}
+	}
+
+	small := syn(0x02, []byte{2, 4, 0x04, 0x00}) // mss 1024
+	if ClampMSS(small, 1280) || mssOf(small) != 1024 {
+		t.Fatal("a smaller MSS was changed")
+	}
+	ack := syn(0x10, linuxSYN) // not a SYN
+	if ClampMSS(ack, 1280) {
+		t.Fatal("a non-SYN segment was changed")
+	}
+	bad := syn(0x02, []byte{2, 9, 0x05, 0xb4}) // option length beyond the header
+	if ClampMSS(bad, 1280) {
+		t.Fatal("a malformed option list was changed")
+	}
+}

@@ -153,7 +153,10 @@ Other node settings: `GOPROXY_IFNAME` (TUN name, `goproxy0`), `GOPROXY_MTU`
 connections to peers and their DNS lookups, so host policy routing can keep them
 out of the TUN), `GOPROXY_PUSH_ROUTES` (below), `GOPROXY_MASQUERADE` (an
 interface to NAT the TUN network out of, see the [exit host
-setup](#exit-host-setup)), plus the obfuscation and fallback settings.
+setup](#exit-host-setup)) and `GOPROXY_MASQUERADE_IPS` (which source networks
+to NAT instead, see the [gateway](#gateway-for-other-devices)),
+`GOPROXY_LOG_CONNECTIONS` (see the [connection log](#connection-log)), plus the
+obfuscation and fallback settings.
 
 ### Pushing routes
 
@@ -170,7 +173,7 @@ the clients it forwards traffic for:
   already has a route for exactly that prefix, it is left alone (with a
   warning in the log);
 - `0.0.0.0/0` becomes a default route in table `GOPROXY_FWMARK` (26479) plus the
-  rules of the [client host setup](#client-host-setup) (`pref 1001`, `1002`,
+  rules of the [client host setup](#client-host-setup) (`pref 1001`–`1004`,
   IPv4 and IPv6) — everything except directly connected networks and the node's
   own connections goes into the TUN. With a strict `rp_filter` this needs the
   CONNMARK lines; the node warns if they are missing.
@@ -181,14 +184,16 @@ host's own traffic keeps its normal routes and never enters the TUN:
 
 ```bash
 # what the node sets up (table = GOPROXY_FWMARK)
-ip route add 10.2.0.0/16 dev goproxy0 table 26479           # every peer prefix, 0.0.0.0/0 as "default"
-ip rule add lookup main suppress_prefixlength 0 pref 1001   # connected networks still win
-ip rule add not iif lo lookup 26479 pref 1002               # "not from this host"
+ip route add 10.2.0.0/16 dev goproxy0 table 26479                        # every peer prefix, 0.0.0.0/0 as "default"
+ip rule add lookup main suppress_prefixlength 0 pref 1001                # connected networks still win
+ip rule add iif goproxy0 lookup 26479 suppress_prefixlength 0 pref 1002  # from the tunnel: transit to peer prefixes,
+ip rule add iif goproxy0 lookup main pref 1003                           #   else the host's routes (never back in)
+ip rule add not iif lo lookup 26479 pref 1004                            # "not from this host"
 ```
 
 - a forwarded destination no peer routes is passed on by the host's normal
   routes. To block it instead, add one rule yourself:
-  `ip rule add not iif lo prohibit pref 1003`;
+  `ip rule add not iif lo prohibit pref 1005`;
 - works with a strict `rp_filter` as is: for forwarded packets the kernel's
   reverse-path check matches the same rule;
 - the host is then not reachable from the peers' networks through the tunnel
@@ -236,8 +241,9 @@ sysctl -w net.ipv4.ip_forward=1
 ```
 
 and either set `GOPROXY_MASQUERADE=eth0` — the node then adds the rules below
-for its TUN network on start and removes them on exit (an identical rule
-already present is taken over) — or add them yourself:
+for its TUN network (or for the networks in `GOPROXY_MASQUERADE_IPS`) on start
+and removes them on exit (an identical rule already present is taken over) —
+or add them yourself:
 
 ```bash
 iptables -t nat -A POSTROUTING -s 10.8.0.0/24 -o eth0 -j MASQUERADE
@@ -283,7 +289,7 @@ enters the TUN is blocked.
 everything into it except directly connected networks, the bypass list and the
 node's own (marked) connections — the same scheme `wg-quick` uses.
 [`GOPROXY_PUSH_ROUTES=true`](#pushing-routes) does the table and the
-`pref 1001`/`1002` rules for you; the bypass rules and the CONNMARK lines stay
+`pref 1001`–`1004` rules for you; the bypass rules and the CONNMARK lines stay
 yours either way:
 
 ```bash
@@ -305,9 +311,13 @@ ip rule add to 192.168.0.0/16 lookup main pref 1000
 # Non-default routes of the main table (connected subnets, docker bridges) still apply...
 ip rule add lookup main suppress_prefixlength 0 pref 1001
 ip -6 rule add lookup main suppress_prefixlength 0 pref 1001
+# ...traffic coming out of the tunnel (e.g. replies to LAN devices behind a
+# router) follows the host's routes and never loops back in by default...
+ip rule add iif $TUN lookup main pref 1003
+ip -6 rule add iif $TUN lookup main pref 1003
 # ...everything else goes to the TUN, except goproxy's own marked sockets.
-ip rule add not fwmark $MARK lookup $TABLE pref 1002
-ip -6 rule add not fwmark $MARK lookup $TABLE pref 1002
+ip rule add not fwmark $MARK lookup $TABLE pref 1004
+ip -6 rule add not fwmark $MARK lookup $TABLE pref 1004
 ```
 
 If `net.ipv4.conf.all.rp_filter` is `1` (strict; the default on RHEL-like
@@ -331,7 +341,7 @@ Notes:
 - For a split tunnel instead, skip the table and rules and route only what the
   peers cover: `ip route add 203.0.113.0/24 dev goproxy0`.
 - To undo: `ip link del $TUN` (drops the table's routes) and
-  `ip [-6] rule del pref 1000|1001|1002` for each rule added.
+  `ip [-6] rule del pref 1000|1001|1003|1004` for each rule added.
 
 #### Gateway for other devices
 
@@ -348,6 +358,20 @@ iptables -A FORWARD -i goproxy0 -m conntrack --ctstate RELATED,ESTABLISHED -j AC
 
 (Instead of `_NAT`, `iptables -t nat -A POSTROUTING -o goproxy0 -j MASQUERADE`
 does the same in the kernel.)
+
+If the LAN router sends **everything** from the devices to the node (its
+default route for them), destinations no peer routes go back out through the
+node's default gateway — that same router, which sends them to the node again:
+a loop. Let the node masquerade the LAN out of that interface, so the router
+sees the node's own traffic and lets it out directly:
+
+```bash
+GOPROXY_MASQUERADE=eth0                  # the LAN interface
+GOPROXY_MASQUERADE_IPS=192.168.0.0/16    # the devices' networks (+ the TUN network if clients connect here)
+```
+
+Then adding or removing `0.0.0.0/0` on a peer is all it takes to switch the
+devices' internet between the tunnel and the direct path.
 
 Forwarded traffic follows the same rules as the host's: bypassed destinations
 go out directly, the rest into the TUN. To tunnel only the devices and keep the
@@ -471,6 +495,29 @@ so the other sites route replies back through DC2 on their own. To use DC1
 instead, point the peer at DC1 (its public key and endpoint) — nothing else
 changes. Alternatively the laptop may connect to all three sites at once, each
 peer routing only its own site's network.
+
+## Connection log
+
+With `GOPROXY_LOG_CONNECTIONS=true` the node writes one line to its log for
+every new connection through the tunnel — who, where, and through which peer:
+
+```
+conn tcp 192.168.1.10:51234 -> 142.250.74.46:443 via EXIT     a client of this node, sent to peer EXIT
+conn udp 10.1.254.2:5353 -> 10.1.20.254:53 from LAPTOP        opened by peer LAPTOP towards this side
+conn icmp 192.168.1.10 -> 8.8.8.8 (echo id 7) via EXIT
+conn tcp 192.168.1.10:40000 -> 1.2.3.4:443 blocked            no peer routes it
+```
+
+- TCP and UDP connections are told apart by ports, pings by identifier; the
+  rest of a connection and its replies are not logged. A connection idle for
+  10 minutes (TCP) or 1 minute (UDP, ICMP) is forgotten and logged again if it
+  resumes; repeated attempts to a blocked destination are logged once.
+- Addresses are the real ones on this node, before `_NAT` or the IP a peer
+  handed out: a client shows up with its own address in its own node's log,
+  and as that node (or its tunnel IP) in the next node's log.
+- Only traffic through the tunnel is seen. Traffic the host routes around it
+  (e.g. `GOPROXY_PUSH_ROUTES=clients` sending unrouted destinations to the
+  default gateway) never reaches the node.
 
 ## Running under systemd
 
@@ -663,8 +710,11 @@ Use real certificates and a strong PSK for anything important.
 ## Notes & limitations
 
 - **MTU is handled automatically.** The inner MTU defaults to 1320, per-packet
-  padding is bounded so wrapped packets never exceed it, and the outer TCP MSS is
-  clamped (1360) — so pages don't "load halfway" on reduced or tunneled paths.
+  padding is bounded so wrapped packets never exceed it, the outer TCP MSS is
+  clamped (1360), and the MSS of TCP connections *through* the tunnel is
+  clamped to the tunnel's MTU − 40 (1280) in both directions — so clients with
+  a 1500 MTU get segments that fit even when path-MTU discovery is broken
+  (ICMP filtered: TLS handshakes that hang, pages that "load halfway").
   If a very small-MTU path still stalls, lower `GOPROXY_MTU` on both sides.
 - `aead` runs over TCP, so a lossy path incurs TCP-over-TCP behaviour. For most
   browsing this is fine; `tls` has the same property. `udp` avoids it.

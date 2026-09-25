@@ -51,7 +51,7 @@ func TestLoadNodeMesh(t *testing.T) {
 	if dc2.Name != "DC2" || dc2.Endpoint != "dc2.example:443" || dc2.Transport != "tls" || len(dc2.Routes) != 2 || !dc2.NAT {
 		t.Fatalf("DC2 = %+v", dc2)
 	}
-	if c.PushRoutes != "false" || c.Masquerade != "" {
+	if c.PushRoutes != "false" || c.Masquerade != "" || c.LogConns {
 		t.Fatalf("PushRoutes = %q, Masquerade = %q; want both off by default", c.PushRoutes, c.Masquerade)
 	}
 	if laptop.Transport != "udp" || laptop.Endpoint != "" || laptop.NAT {
@@ -85,6 +85,8 @@ func TestLoadNodeErrors(t *testing.T) {
 		"bad transport":  {map[string]string{"GOPROXY_PEER_A_IP": "10.8.0.2", "GOPROXY_TRANSPORT": "quic"}, "GOPROXY_TRANSPORT"},
 		"bad push":       {map[string]string{"GOPROXY_PEER_A_IP": "10.8.0.2", "GOPROXY_PUSH_ROUTES": "host"}, "GOPROXY_PUSH_ROUTES"},
 		"bad masquerade": {map[string]string{"GOPROXY_PEER_A_IP": "10.8.0.2", "GOPROXY_MASQUERADE": "10.0.0.0/8"}, "GOPROXY_MASQUERADE"},
+		"masq ips alone": {map[string]string{"GOPROXY_PEER_A_IP": "10.8.0.2", "GOPROXY_MASQUERADE_IPS": "10.0.0.0/8"}, "needs GOPROXY_MASQUERADE"},
+		"bad masq ips":   {map[string]string{"GOPROXY_PEER_A_IP": "10.8.0.2", "GOPROXY_MASQUERADE": "eth0", "GOPROXY_MASQUERADE_IPS": "10.0.0.1"}, "GOPROXY_MASQUERADE_IPS"},
 		"bad fwmark":     {map[string]string{"GOPROXY_PEER_A_IP": "10.8.0.2", "GOPROXY_FWMARK": "zero"}, "GOPROXY_FWMARK"},
 		"no private key": {map[string]string{"GOPROXY_PEER_A_IP": "10.8.0.2", "GOPROXY_PRIVATE_KEY": ""}, "GOPROXY_PRIVATE_KEY"},
 	} {

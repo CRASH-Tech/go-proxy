@@ -38,7 +38,8 @@ services:
         # bypass, one rule per prefix (e.g. your LAN, reached via the docker host):
         # ip rule add to 192.168.0.0/16 lookup main pref 1000
         ip rule add lookup main suppress_prefixlength 0 pref 1001
-        ip rule add not fwmark $$MARK lookup $$TABLE pref 1002
+        ip rule add iif $$TUN lookup main pref 1003
+        ip rule add not fwmark $$MARK lookup $$TABLE pref 1004
         iptables -t mangle -A OUTPUT -m mark --mark $$MARK -j CONNMARK --save-mark
         iptables -t mangle -A PREROUTING -m connmark --mark $$MARK -j CONNMARK --restore-mark
         exec goproxy node

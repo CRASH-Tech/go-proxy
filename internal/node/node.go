@@ -13,11 +13,13 @@ import (
 	"fmt"
 	"log"
 	"net/netip"
+	"strings"
 	"sync"
 	"time"
 
 	"goproxy/internal/config"
 	"goproxy/internal/fallback"
+	"goproxy/internal/flowlog"
 	"goproxy/internal/hostnat"
 	"goproxy/internal/hostroute"
 	"goproxy/internal/ipx"
@@ -37,6 +39,7 @@ type Node struct {
 	peers  []*peer
 	byKey  map[keys.PublicKey]*peer
 	routes route.Table[*peer]
+	flows  *flowlog.Logger // nil unless GOPROXY_LOG_CONNECTIONS
 
 	dev *tun.Device
 }
@@ -62,6 +65,9 @@ func New(cfg *config.NodeConfig) (*Node, error) {
 		tunNet: addr.Masked().String(),
 		fb:     fb,
 		byKey:  map[keys.PublicKey]*peer{},
+	}
+	if cfg.LogConns {
+		n.flows = flowlog.New(log.Printf)
 	}
 	for i := range cfg.Peers {
 		p, err := newPeer(&cfg.Peers[i], cfg.FwMark, addr.Addr().As4())
@@ -116,13 +122,17 @@ func (n *Node) Run(stop <-chan struct{}) error {
 		log.Printf("pushed the peers' %d route(s) into %s (%s)", len(prefixes), dev.Name(), whom)
 	}
 	if n.cfg.Masquerade != "" {
+		networks := n.cfg.MasqueradeIPs
+		if len(networks) == 0 {
+			networks = []string{n.tunNet}
+		}
 		warn := func(msg string) { log.Printf("masquerade: warning: %s", msg) }
-		unmasq, err := hostnat.Masquerade(n.tunNet, n.cfg.Masquerade, warn)
+		unmasq, err := hostnat.Masquerade(networks, n.cfg.Masquerade, warn)
 		if err != nil {
 			return fmt.Errorf("masquerade: %w", err)
 		}
 		defer unmasq()
-		log.Printf("masquerading %s out of %s", n.tunNet, n.cfg.Masquerade)
+		log.Printf("masquerading %s out of %s", strings.Join(networks, ", "), n.cfg.Masquerade)
 	}
 
 	errc := make(chan error, 1)
@@ -151,7 +161,7 @@ func (n *Node) Run(stop <-chan struct{}) error {
 		}(p)
 	}
 	go n.tunReader()
-	go n.expireNAT(quit)
+	go n.housekeeping(quit)
 
 	var runErr error
 	select {
@@ -179,12 +189,18 @@ func (n *Node) tunReader() {
 		pkt := buf[:m]
 		if ipx.Version(pkt) == 4 && m >= 20 {
 			if p, ok := n.routes.Lookup([4]byte(pkt[16:20])); ok {
+				if n.flows != nil {
+					n.flows.Seen(pkt, "via "+p.name)
+				}
 				p.send(append([]byte(nil), pkt...), n.tunIP)
 				continue
 			}
 		}
 		// Not routed to any peer: blocked. Answer so the sender fails fast.
 		if r := ipx.Reject(pkt); r != nil {
+			if n.flows != nil {
+				n.flows.Blocked(pkt)
+			}
 			_, _ = n.dev.Write(r)
 		}
 	}
@@ -207,13 +223,17 @@ func (n *Node) deliver(l *link, pkt []byte) {
 	if owner, ok := n.routes.Lookup([4]byte(pkt[12:16])); !(ok && owner == l.p) && !ipx.IsICMPv4Error(pkt) {
 		return
 	}
+	ipx.ClampMSS(pkt, l.mss)
+	if n.flows != nil {
+		n.flows.Seen(pkt, "from "+l.p.name)
+	}
 	if _, err := n.dev.Write(pkt); err != nil {
 		log.Printf("[%s] tun write: %v", l.p.name, err)
 	}
 }
 
-// expireNAT drops idle NAT mappings until quit is closed.
-func (n *Node) expireNAT(quit <-chan struct{}) {
+// housekeeping drops idle NAT mappings and logged flows until quit is closed.
+func (n *Node) housekeeping(quit <-chan struct{}) {
 	t := time.NewTicker(30 * time.Second)
 	defer t.Stop()
 	for {
@@ -225,6 +245,9 @@ func (n *Node) expireNAT(quit <-chan struct{}) {
 				if p.nat != nil {
 					p.nat.Expire()
 				}
+			}
+			if n.flows != nil {
+				n.flows.Expire()
 			}
 		}
 	}

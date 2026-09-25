@@ -141,3 +141,49 @@ func IsICMPv4Error(pkt []byte) bool {
 	ihl, ok := header4(pkt)
 	return ok && pkt[9] == protoICMP && len(pkt) > ihl && isICMPError4(pkt[ihl])
 }
+
+// ClampMSS lowers the MSS option of an IPv4 TCP SYN (or SYN-ACK) to mss when it
+// is larger, fixing the TCP checksum, so the endpoints never send segments that
+// do not fit the tunnel -- without relying on path-MTU discovery, whose ICMP is
+// often filtered or ignored. It reports whether the packet was changed.
+func ClampMSS(pkt []byte, mss uint16) bool {
+	ihl, ok := header4(pkt)
+	if !ok || pkt[9] != protoTCP || binary.BigEndian.Uint16(pkt[6:8])&0x1fff != 0 {
+		return false
+	}
+	tcp := pkt[ihl:]
+	if len(tcp) < 20 || tcp[13]&0x02 == 0 { // not a SYN
+		return false
+	}
+	doff := int(tcp[12]>>4) * 4
+	if doff < 20 || len(tcp) < doff {
+		return false
+	}
+	opts := tcp[20:doff]
+	for i := 0; i < len(opts); {
+		switch kind := opts[i]; kind {
+		case 0: // end of options
+			return false
+		case 1: // no-op
+			i++
+			continue
+		}
+		if i+1 >= len(opts) || opts[i+1] < 2 || i+int(opts[i+1]) > len(opts) {
+			return false
+		}
+		if opts[i] == 2 && opts[i+1] == 4 { // MSS
+			field := opts[i+2 : i+4]
+			if binary.BigEndian.Uint16(field) <= mss {
+				return false
+			}
+			var old, new [2]byte
+			copy(old[:], field)
+			binary.BigEndian.PutUint16(new[:], mss)
+			copy(field, new[:])
+			AdjustChecksum(tcp[16:18], old[:], new[:], false)
+			return true
+		}
+		i += int(opts[i+1])
+	}
+	return false
+}

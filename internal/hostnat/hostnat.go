@@ -1,8 +1,10 @@
-// Package hostnat masquerades the node's TUN network out of a host interface
-// (GOPROXY_MASQUERADE), so clients whose traffic leaves the tunnel here --
-// road warriors, other nodes' clients -- reach the internet with the host's
-// address. It installs iptables rules and removes them again; sysctls stay
-// the admin's.
+// Package hostnat masquerades source networks out of a host interface
+// (GOPROXY_MASQUERADE, GOPROXY_MASQUERADE_IPS): by default the node's TUN
+// network, so clients whose traffic leaves the tunnel here -- road warriors,
+// other nodes' clients -- reach the internet with the host's address; or e.g.
+// a LAN whose router sends everything to the node, so traffic the node sends
+// straight back out of the same interface does not loop. It installs iptables
+// rules and removes them again; sysctls stay the admin's.
 package hostnat
 
 import (
@@ -12,7 +14,7 @@ import (
 	"strings"
 )
 
-// Masquerade adds, for traffic from network (the TUN's CIDR) out of iface:
+// Masquerade adds, for traffic from each of networks out of iface:
 //
 //	-t nat    POSTROUTING -s <network> -o <iface> -j MASQUERADE
 //	-t filter FORWARD     -s <network> -o <iface> -j ACCEPT
@@ -22,12 +24,14 @@ import (
 // docker). Identical rules left behind by a crashed run are replaced rather
 // than duplicated. Problems that do not prevent it (forwarding off) are
 // reported via warn. The returned func removes the rules.
-func Masquerade(network, iface string, warn func(string)) (func(), error) {
-	rules := [][]string{
-		{"-t", "nat", "POSTROUTING", "-s", network, "-o", iface, "-j", "MASQUERADE"},
-		{"-t", "filter", "FORWARD", "-s", network, "-o", iface, "-j", "ACCEPT"},
-		{"-t", "filter", "FORWARD", "-d", network, "-i", iface,
-			"-m", "conntrack", "--ctstate", "RELATED,ESTABLISHED", "-j", "ACCEPT"},
+func Masquerade(networks []string, iface string, warn func(string)) (func(), error) {
+	var rules [][]string
+	for _, network := range networks {
+		rules = append(rules,
+			[]string{"-t", "nat", "POSTROUTING", "-s", network, "-o", iface, "-j", "MASQUERADE"},
+			[]string{"-t", "filter", "FORWARD", "-s", network, "-o", iface, "-j", "ACCEPT"},
+			[]string{"-t", "filter", "FORWARD", "-d", network, "-i", iface,
+				"-m", "conntrack", "--ctstate", "RELATED,ESTABLISHED", "-j", "ACCEPT"})
 	}
 	var added [][]string
 	cleanup := func() {

@@ -14,8 +14,9 @@
 //     did not originate on the host ("not iif lo") there.
 //
 // In both, the host's non-default main-table routes (connected networks)
-// still win, and with a default route IPv6 is sent to the TUN too, where it is
-// blocked instead of leaking. Only routes and rules are touched -- no sysctls
+// still win, traffic coming out of the tunnel is never sent back into it by a
+// default route, and with a default route IPv6 is sent to the TUN too, where
+// it is blocked instead of leaking. Only routes and rules are touched -- no sysctls
 // or firewall. Everything added is removed by the returned cleanup.
 package hostroute
 
@@ -40,9 +41,15 @@ const (
 // cleared before use, so rules left behind by a crashed run are replaced
 // rather than duplicated.
 const (
-	prefSuppress = 1001 // lookup main suppress_prefixlength 0
-	prefTunnel   = 1002 // All: not fwmark <mark> lookup <table>; Clients: not iif lo lookup <table>
+	prefSuppress   = 1001 // lookup main suppress_prefixlength 0
+	prefFromTunnel = 1002 // iif <tun> lookup <table> suppress_prefixlength 0
+	prefFromTunEnd = 1003 // iif <tun> lookup main
+	prefTunnel     = 1004 // All: not fwmark <mark> lookup <table>; Clients: not iif lo lookup <table>
 )
+
+// allPrefs lists every priority used, including those of older versions, so a
+// crashed run's rules are cleared whatever version left them.
+var allPrefs = []int{prefSuppress, prefFromTunnel, prefFromTunEnd, prefTunnel}
 
 // Push routes prefixes into dev for scope. table is the routing table used for
 // policy routing -- GOPROXY_FWMARK, which is also the SO_MARK of the node's own
@@ -143,7 +150,7 @@ func (p *pusher) clients(prefixes []netip.Prefix) error {
 // clearPolicy removes rules and table routes left behind by a crashed run.
 func (p *pusher) clearPolicy() {
 	for _, fam := range []string{"-4", "-6"} {
-		for _, pref := range []int{prefSuppress, prefTunnel} {
+		for _, pref := range allPrefs {
 			for run("ip", fam, "rule", "del", "pref", fmt.Sprint(pref)) == nil {
 			}
 		}
@@ -151,13 +158,23 @@ func (p *pusher) clearPolicy() {
 	}
 }
 
-// policy fills the node's table with dsts (into dev) and adds the rules: the
-// main table without its default route first, then the node's table for
-// packets matching sel.
+// policy fills the node's table with dsts (into dev) and adds the rules:
+//
+//	1001  lookup main suppress_prefixlength 0          connected networks win
+//	1002  iif <tun> lookup <table> suppress_prefixlength 0
+//	1003  iif <tun> lookup main                        from the tunnel: transit to
+//	                                                   peer prefixes, else the host's
+//	                                                   routes -- never back in by default
+//	1004  <sel> lookup <table>                         the rest into the TUN
+//
+// Without 1002/1003, a reply coming out of the tunnel to a client that the
+// host reaches only via its default gateway (a LAN behind a router) would
+// match the table's default route and loop back into the TUN.
 func (p *pusher) policy(fam string, sel, dsts []string) error {
 	p.undo = append(p.undo, func() {
-		_ = run("ip", fam, "rule", "del", "pref", fmt.Sprint(prefTunnel))
-		_ = run("ip", fam, "rule", "del", "pref", fmt.Sprint(prefSuppress))
+		for i := len(allPrefs) - 1; i >= 0; i-- {
+			_ = run("ip", fam, "rule", "del", "pref", fmt.Sprint(allPrefs[i]))
+		}
 		_ = run("ip", fam, "route", "flush", "table", p.table)
 	})
 	for _, dst := range dsts {
@@ -165,11 +182,18 @@ func (p *pusher) policy(fam string, sel, dsts []string) error {
 			return err
 		}
 	}
-	if err := run("ip", fam, "rule", "add", "lookup", "main", "suppress_prefixlength", "0", "pref", fmt.Sprint(prefSuppress)); err != nil {
-		return err
+	rules := [][]string{
+		{"lookup", "main", "suppress_prefixlength", "0", "pref", fmt.Sprint(prefSuppress)},
+		{"iif", p.dev, "lookup", p.table, "suppress_prefixlength", "0", "pref", fmt.Sprint(prefFromTunnel)},
+		{"iif", p.dev, "lookup", "main", "pref", fmt.Sprint(prefFromTunEnd)},
+		append(append([]string{}, sel...), "lookup", p.table, "pref", fmt.Sprint(prefTunnel)),
 	}
-	rule := append([]string{"ip", fam, "rule", "add"}, sel...)
-	return run(append(rule, "lookup", p.table, "pref", fmt.Sprint(prefTunnel))...)
+	for _, r := range rules {
+		if err := run(append([]string{"ip", fam, "rule", "add"}, r...)...); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // policyV6 captures IPv6 into the TUN (to be blocked) alongside a default route.

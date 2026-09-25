@@ -81,12 +81,14 @@ func (p *Peer) Prefixes() ([]netip.Prefix, error) {
 type NodeConfig struct {
 	PrivateKey string
 
-	InterfaceName string // TUN device name
-	Address       string // TUN address (IPv4 CIDR)
-	MTU           int    // TUN MTU
-	FwMark        int    // SO_MARK of the node's own connections to peers
-	PushRoutes    string // host routes for the peers' prefixes: false | true | clients
-	Masquerade    string // interface to masquerade the TUN network out of; empty = off
+	InterfaceName string   // TUN device name
+	Address       string   // TUN address (IPv4 CIDR)
+	MTU           int      // TUN MTU
+	FwMark        int      // SO_MARK of the node's own connections to peers
+	PushRoutes    string   // host routes for the peers' prefixes: false | true | clients
+	Masquerade    string   // interface to masquerade out of; empty = off
+	MasqueradeIPs []string // source networks to masquerade; empty = the TUN network
+	LogConns      bool     // log every new connection through the tunnel
 
 	Listen    string // empty => do not accept connections
 	Transport string // listener transport: aead | tls | udp
@@ -189,6 +191,8 @@ func LoadNode() (*NodeConfig, error) {
 		MTU:           envInt("GOPROXY_MTU", 1320),
 		PushRoutes:    pushRoutes(env("GOPROXY_PUSH_ROUTES", "")),
 		Masquerade:    strings.TrimSpace(env("GOPROXY_MASQUERADE", "")),
+		MasqueradeIPs: splitList(env("GOPROXY_MASQUERADE_IPS", "")),
+		LogConns:      envBool("GOPROXY_LOG_CONNECTIONS", false),
 		Listen:        env("GOPROXY_LISTEN", ""),
 		Transport:     env("GOPROXY_TRANSPORT", "aead"),
 		TLS: TLSServerConfig{
@@ -268,6 +272,14 @@ func (c *NodeConfig) validate() error {
 	}
 	if strings.ContainsAny(c.Masquerade, " \t/") || len(c.Masquerade) > 15 {
 		return fmt.Errorf("GOPROXY_MASQUERADE %q: need an interface name, e.g. eth0", c.Masquerade)
+	}
+	if len(c.MasqueradeIPs) > 0 && c.Masquerade == "" {
+		return fmt.Errorf("GOPROXY_MASQUERADE_IPS needs GOPROXY_MASQUERADE (the interface)")
+	}
+	for _, cidr := range c.MasqueradeIPs {
+		if p, err := netip.ParsePrefix(cidr); err != nil || !p.Addr().Is4() {
+			return fmt.Errorf("GOPROXY_MASQUERADE_IPS %q: need IPv4 CIDRs, e.g. 192.168.0.0/16", cidr)
+		}
 	}
 	if err := c.validateFallback(); err != nil {
 		return err

@@ -118,6 +118,7 @@ func (p *peer) send(pkt []byte, tunIP [4]byte) {
 	if l.localIP != 0 {
 		ipx.RewriteSrc4(pkt, tunIP, ip4(l.localIP))
 	}
+	ipx.ClampMSS(pkt, l.mss)
 	select {
 	case l.queue <- pkt:
 	default:
@@ -146,6 +147,10 @@ type link struct {
 	// 0 = none): our TUN address is translated to it and back.
 	localIP uint32
 
+	// mss caps the MSS of TCP handshakes through the link so segments fit the
+	// tunnel (the smaller of both sides' MTU, minus IPv4 and TCP headers).
+	mss uint16
+
 	queue    chan []byte
 	done     chan struct{}
 	once     sync.Once
@@ -159,6 +164,7 @@ func (n *Node) newLink(p *peer, outbound bool, sess session, mtu int) *link {
 		p:        p,
 		outbound: outbound,
 		sess:     sess,
+		mss:      uint16(min(mtu, n.cfg.MTU) - 40),
 		queue:    make(chan []byte, 512),
 		done:     make(chan struct{}),
 	}

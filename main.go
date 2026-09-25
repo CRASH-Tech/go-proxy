@@ -168,6 +168,12 @@ node:
   GOPROXY_MASQUERADE         interface to NAT the TUN network out of, e.g. eth0
                              (iptables MASQUERADE + FORWARD accepts, removed on
                              exit; net.ipv4.ip_forward stays yours) (default: off)
+  GOPROXY_MASQUERADE_IPS     source CIDRs to NAT out of GOPROXY_MASQUERADE instead
+                             of the TUN network, e.g. a LAN whose router sends
+                             everything to the node (default: the TUN network)
+  GOPROXY_LOG_CONNECTIONS    log one line per new connection through the tunnel:
+                             who, where, via/from which peer, or blocked
+                             (default: false)
   GOPROXY_OBFS_MAX_PAD       max random padding bytes per record (default: 255)
   GOPROXY_OBFS_COVER         send randomised cover traffic       (default: true)
 
