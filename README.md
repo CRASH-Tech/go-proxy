@@ -57,6 +57,18 @@ Linux only. Requires root (or `CAP_NET_ADMIN`) for the TUN.
 go build -o goproxy .
 ```
 
+Or take a release: every `v*` tag builds static Linux binaries (`amd64`,
+`arm64`, `armv7`, with `SHA256SUMS`) attached to the GitHub release, and a
+multi-arch image `crashntech/go-proxy:<tag>` (plus `latest` unless the tag is a
+pre-release such as `v0.2.0-rc1`). See
+[`.github/workflows/release.yml`](.github/workflows/release.yml); it needs the
+repository secrets `DOCKERHUB_USERNAME` and `DOCKERHUB_TOKEN` (and optionally
+the variable `DOCKER_IMAGE` for another image name).
+
+```bash
+git tag v0.1.0 && git push origin v0.1.0
+```
+
 ## Keys
 
 Every node has its own static key pair; each node lists the **public** keys of
