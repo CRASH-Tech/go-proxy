@@ -1,7 +1,8 @@
-# Server: terminates client tunnels and NATs their traffic to the internet.
+# Exit node: accepts client nodes and NATs their traffic to the internet
+# (GOPROXY_MASQUERADE=eth0 in server.env).
 #
 #   cd deploy
-#   cp server.env.example server.env   # then edit keys/psk/clients
+#   cp server.env.example server.env   # then edit keys/psk/peers
 #   docker compose -f docker-compose.server.yml up -d --build
 #
 services:
@@ -12,10 +13,9 @@ services:
     image: goproxy:latest
     container_name: goproxy-server
     restart: unless-stopped
-    command: ["server"]
     env_file:
       - server.env
-    # Required to create the TUN device and manage iptables/routes.
+    # Required to create the TUN device and for the GOPROXY_MASQUERADE rules.
     cap_add:
       - NET_ADMIN
     devices:
@@ -23,15 +23,16 @@ services:
     # IP forwarding in the container's own network namespace (namespaced sysctl).
     sysctls:
       net.ipv4.ip_forward: "1"
+    # Client traffic is masqueraded out of eth0 (the docker bridge) by the node
+    # (GOPROXY_MASQUERADE), then the docker host NATs it to the internet.
+    command: ["node"]
     # Expose the listen port. Must match GOPROXY_LISTEN in server.env.
     ports:
       - "443:443"
-    # The server MASQUERADEs client traffic out of its default interface (eth0
-    # on the docker bridge), so outbound goes bridge -> host -> internet.
 
     # --- Alternative: host networking (for a dedicated VPS) ---
-    # Listen on the host IP directly and NAT via the real host interface.
-    # Replace the bridge/ports/sysctls block above with:
+    # Listen on the host IP directly and NAT via the real host interface:
     #   network_mode: host
-    # and ensure the host has net.ipv4.ip_forward=1
-    # (sysctl -w net.ipv4.ip_forward=1). Keep cap_add and devices.
+    # Set GOPROXY_MASQUERADE to the host's uplink (e.g. eth0), enable
+    # net.ipv4.ip_forward on the host, and drop the ports/sysctls above
+    # (keep cap_add, devices, env_file and command).

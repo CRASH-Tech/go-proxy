@@ -77,12 +77,13 @@ func (d *Device) Write(pkt []byte) (int, error) {
 func (d *Device) Close() error { return d.f.Close() }
 
 // Configure brings the interface up with the given CIDR address and MTU using
-// the iproute2 tools.
+// the iproute2 tools. The address is replaced, not added, so a persistent TUN
+// (ip tuntap add) that kept it from a previous run is reused as is.
 func (d *Device) Configure(cidr string, mtu int) error {
 	steps := [][]string{
 		{"ip", "link", "set", "dev", d.name, "up"},
 		{"ip", "link", "set", "dev", d.name, "mtu", fmt.Sprintf("%d", mtu)},
-		{"ip", "addr", "add", cidr, "dev", d.name},
+		{"ip", "addr", "replace", cidr, "dev", d.name},
 	}
 	for _, s := range steps {
 		if out, err := exec.Command(s[0], s[1:]...).CombinedOutput(); err != nil {

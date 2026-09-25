@@ -35,16 +35,40 @@ func tuneTCP(c net.Conn) {
 	}
 }
 
+// ClientDialer returns the dialer for the client's outer connections over
+// network ("tcp" or "udp"). Its sockets -- and those of the DNS resolver used to
+// look up the server's address -- are tagged with SO_MARK mark (0 = none), so
+// the client's policy routing keeps them off its own TUN.
+func ClientDialer(network string, mark int) *net.Dialer {
+	ctl := sockopt.TCPControl
+	if network == "udp" {
+		ctl = sockopt.UDPControl
+	}
+	resolverDialer := &net.Dialer{Control: sockopt.MarkedControl(mark, nil)}
+	return &net.Dialer{
+		Timeout: 15 * time.Second,
+		Control: sockopt.MarkedControl(mark, ctl),
+		Resolver: &net.Resolver{
+			PreferGo: true,
+			Dial:     resolverDialer.DialContext,
+		},
+	}
+}
+
 // --- aead (raw TCP) ---
 
-type tcpTransport struct{}
+type tcpTransport struct {
+	dialer *net.Dialer
+}
 
-// NewTCP returns a raw-TCP transport (used with the "aead" mode).
-func NewTCP() Transport { return tcpTransport{} }
+// NewTCP returns a raw-TCP transport (used with the "aead" mode) for listening.
+func NewTCP() Transport { return tcpTransport{dialer: ClientDialer("tcp", 0)} }
 
-func (tcpTransport) Dial(addr string) (net.Conn, error) {
-	d := &net.Dialer{Timeout: 15 * time.Second, Control: sockopt.TCPControl}
-	c, err := d.Dial("tcp", addr)
+// NewTCPClient returns a raw-TCP transport whose sockets carry SO_MARK mark.
+func NewTCPClient(mark int) Transport { return tcpTransport{dialer: ClientDialer("tcp", mark)} }
+
+func (t tcpTransport) Dial(addr string) (net.Conn, error) {
+	c, err := t.dialer.Dial("tcp", addr)
 	if err != nil {
 		return nil, err
 	}
@@ -60,25 +84,25 @@ func (tcpTransport) Listen(addr string) (net.Listener, error) {
 // --- tls ---
 
 type tlsClientTransport struct {
-	cfg *tls.Config
+	cfg    *tls.Config
+	dialer *net.Dialer
 }
 
 // NewTLSClient returns a TLS transport for the client. sni sets the SNI/ServerName
 // (leave empty to skip). insecure disables certificate verification (needed for
-// self-signed server certs).
-func NewTLSClient(sni string, insecure bool) Transport {
+// self-signed server certs). Sockets carry SO_MARK mark (0 = none).
+func NewTLSClient(sni string, insecure bool, mark int) Transport {
 	cfg := &tls.Config{
 		ServerName:         sni,
 		InsecureSkipVerify: insecure,
 		MinVersion:         tls.VersionTLS12,
 		NextProtos:         []string{"h2", "http/1.1"},
 	}
-	return tlsClientTransport{cfg: cfg}
+	return tlsClientTransport{cfg: cfg, dialer: ClientDialer("tcp", mark)}
 }
 
 func (t tlsClientTransport) Dial(addr string) (net.Conn, error) {
-	d := &net.Dialer{Timeout: 15 * time.Second, Control: sockopt.TCPControl}
-	c, err := tls.DialWithDialer(d, "tcp", addr, t.cfg)
+	c, err := tls.DialWithDialer(t.dialer, "tcp", addr, t.cfg)
 	if err != nil {
 		return nil, err
 	}

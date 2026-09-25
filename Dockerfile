@@ -15,5 +15,5 @@ FROM alpine:3.20
 RUN apk add --no-cache iptables ip6tables iproute2
 COPY --from=build /out/goproxy /usr/local/bin/goproxy
 ENTRYPOINT ["goproxy"]
-# Role is chosen by the command: "server" or "client" (set in compose).
+# Run a node with the "node" command (set in compose); config comes from env.
 CMD ["env"]

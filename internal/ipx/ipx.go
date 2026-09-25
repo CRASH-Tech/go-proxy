@@ -1,5 +1,6 @@
-// Package ipx contains minimal helpers to read source/destination addresses
-// from raw IPv4/IPv6 packets for routing decisions.
+// Package ipx contains minimal helpers for raw IPv4/IPv6 packets: reading
+// addresses for routing decisions, rewriting them (with checksum fix-ups) and
+// building ICMP rejects.
 package ipx
 
 import "net"

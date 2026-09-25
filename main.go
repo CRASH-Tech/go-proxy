@@ -1,5 +1,7 @@
-// Command goproxy is a single binary that runs either as a client or a server
-// to build an encrypted, DPI-obfuscating layer-3 tunnel over TCP.
+// Command goproxy builds encrypted, DPI-obfuscating layer-3 tunnels between
+// nodes. Every instance is a node: it accepts peers, connects to peers, or
+// both, so the same binary serves as an exit server, a client or a site in a
+// mesh.
 //
 // All runtime configuration comes from environment variables (see the README
 // or `goproxy env` for the full list). Usage:
@@ -8,8 +10,7 @@
 //	goproxy pubkey < private.key         derive the public key from a private key
 //	goproxy keypair                      print a fresh private+public key pair
 //	goproxy gencert -host H -cert C -key K   write a self-signed TLS cert/key
-//	goproxy server                       run as server  (configured via env)
-//	goproxy client                       run as client  (configured via env)
+//	goproxy node                         run a node     (configured via env)
 //	goproxy env                          print all recognised environment variables
 package main
 
@@ -24,10 +25,9 @@ import (
 	"strings"
 	"syscall"
 
-	"goproxy/internal/client"
 	"goproxy/internal/config"
 	"goproxy/internal/keys"
-	"goproxy/internal/server"
+	"goproxy/internal/node"
 	"goproxy/internal/transport"
 )
 
@@ -50,10 +50,8 @@ func main() {
 		cmdGencert(os.Args[2:])
 	case "env":
 		fmt.Print(envReference)
-	case "server":
-		cmdServer()
-	case "client":
-		cmdClient()
+	case "node":
+		cmdNode()
 	case "-h", "--help", "help":
 		usage()
 	default:
@@ -74,8 +72,7 @@ commands:
   keypair                        print a fresh private and public key pair
   gencert -host H -cert C -key K write a self-signed TLS certificate/key
   env                            list all recognised environment variables
-  server                         run as server (configured via env)
-  client                         run as client (configured via env)
+  node                           run a node (configured via env)
 `)
 }
 
@@ -118,38 +115,21 @@ func cmdGencert(args []string) {
 	}
 }
 
-func cmdServer() {
-	cfg, err := config.LoadServer()
+func cmdNode() {
+	cfg, err := config.LoadNode()
 	if err != nil {
-		log.Fatalf("server: %v", err)
+		log.Fatalf("node: %v", err)
 	}
-	srv, err := server.New(cfg)
+	n, err := node.New(cfg)
 	if err != nil {
-		log.Fatalf("server: %v", err)
-	}
-
-	go handleSignals(func() { srv.Close() })
-
-	if err := srv.Run(); err != nil {
-		log.Fatalf("server: %v", err)
-	}
-}
-
-func cmdClient() {
-	cfg, err := config.LoadClient()
-	if err != nil {
-		log.Fatalf("client: %v", err)
-	}
-	cl, err := client.New(cfg)
-	if err != nil {
-		log.Fatalf("client: %v", err)
+		log.Fatalf("node: %v", err)
 	}
 
 	stop := make(chan struct{})
 	go handleSignals(func() { close(stop) })
 
-	if err := cl.Run(stop); err != nil {
-		log.Fatalf("client: %v", err)
+	if err := n.Run(stop); err != nil {
+		log.Fatalf("node: %v", err)
 	}
 	log.Printf("shut down cleanly")
 }
@@ -162,40 +142,47 @@ func handleSignals(onSignal func()) {
 	onSignal()
 }
 
-const envReference = `goproxy environment variables
+const envReference = `goproxy environment variables (goproxy node)
 
-common:
+node:
+  GOPROXY_PRIVATE_KEY        this node's X25519 private key (base64)   [required]
+  GOPROXY_IFNAME             TUN device name          (default: goproxy0)
+  GOPROXY_TUN_ADDRESS        TUN address; its network is where handed-out peer
+                             IPs live               (default: 10.255.255.1/32)
+  GOPROXY_MTU                TUN (inner) MTU          (default: 1320)
+                             padding is bounded to it and the outer TCP MSS is
+                             clamped, so packets fit typical/tunneled paths.
+  GOPROXY_FWMARK             SO_MARK set on connections to peers (and their DNS
+                             lookups), for host policy routing (default: 0x676f)
+  GOPROXY_PUSH_ROUTES        route the peers' prefixes into the TUN on the host
+                             (removed on exit): false | true | clients
+                             (default: false)
+                             true:    for the host and its clients -- prefixes
+                                      "ip route add <cidr> dev <tun>", 0.0.0.0/0
+                                      via table GOPROXY_FWMARK + ip rules that
+                                      exempt the node's own marked connections
+                             clients: only for forwarded traffic -- all prefixes
+                                      in table GOPROXY_FWMARK, used via
+                                      "ip rule ... not iif lo"; the host's own
+                                      traffic keeps its routes
+  GOPROXY_MASQUERADE         interface to NAT the TUN network out of, e.g. eth0
+                             (iptables MASQUERADE + FORWARD accepts, removed on
+                             exit; net.ipv4.ip_forward stays yours) (default: off)
+  GOPROXY_OBFS_MAX_PAD       max random padding bytes per record (default: 255)
+  GOPROXY_OBFS_COVER         send randomised cover traffic       (default: true)
+
+accepting peers (optional):
+  GOPROXY_LISTEN             listen address, e.g. 0.0.0.0:443 (default: none)
   GOPROXY_TRANSPORT          aead | tls | udp         (default: aead)
                              aead: raw TCP, obfuscated, Elligator2 handshake
                              tls:  looks like HTTPS
                              udp:  datagram tunnel (no TCP-over-TCP, tolerates
                                    loss/reorder; anti-replay windowed)
-  GOPROXY_PRIVATE_KEY        this peer's X25519 private key (base64)   [required]
-  GOPROXY_PSK                shared secret; must match the peer        (default: none)
-  GOPROXY_MTU                tunnel (inner) MTU       (default: 1320)
-                             padding is bounded to it and the outer TCP MSS is
-                             clamped, so packets fit typical/tunneled paths.
-                             Lower it if you still see stalls on a small-MTU path.
-  GOPROXY_IFNAME             TUN device name          (default: kernel-assigned)
-  GOPROXY_OBFS_MAX_PAD       max random padding bytes per record (default: 255)
-  GOPROXY_OBFS_COVER         send randomised cover traffic       (default: true)
-
-server (goproxy server):
-  GOPROXY_LISTEN             listen address, e.g. 0.0.0.0:443          [required]
-  GOPROXY_TUNNEL_SUBNET      tunnel subnet            (default: 10.8.0.0/24)
-  GOPROXY_TUNNEL_SERVER_IP   server's tunnel IP       (default: 10.8.0.1)
-  GOPROXY_AUTO_NAT           enable IP-forward + MASQUERADE (default: true)
-  GOPROXY_EGRESS_INTERFACE   NAT egress iface         (default: autodetect)
-  GOPROXY_TLS_CERT           TLS cert path (tls mode; empty => self-signed)
+                             also the default transport for connecting to peers
+  GOPROXY_TLS_CERT           TLS cert path (tls; empty => self-signed)
   GOPROXY_TLS_KEY            TLS key path
   GOPROXY_TLS_HOST           self-signed cert host    (default: www.microsoft.com)
-  GOPROXY_CLIENT_<NAME>      authorize a client (one var each; at least one
-                             required). Value: "pubkey,ip[,allowed_ips]" where
-                             allowed_ips are space-separated. <NAME> is the label.
-                             Example:
-                               GOPROXY_CLIENT_LAPTOP=PUBA=,10.8.0.2
-                               GOPROXY_CLIENT_PC=PUBB=,10.8.0.3,192.168.50.0/24
-  GOPROXY_FALLBACK_MODE      what to do with connections that fail the client
+  GOPROXY_FALLBACK_MODE      what to do with connections that fail the
                              handshake (probes/scanners): off (default) |
                              status | redirect | proxy
   GOPROXY_FALLBACK_STATUS    HTTP status for "status" mode      (default: 403)
@@ -203,26 +190,39 @@ server (goproxy server):
   GOPROXY_FALLBACK_TARGET    backend host:port for "proxy" mode (transparently
                              reverse-proxied; e.g. a local nginx or a real site)
 
-client (goproxy client) -- one tunnel per server:
-  GOPROXY_SERVER_<NAME>            server host:port (declares a server; >=1 required)
-  GOPROXY_SERVER_<NAME>_PUBLIC_KEY server's X25519 public key (base64)   [required]
-  GOPROXY_SERVER_<NAME>_ROUTES     CIDRs to send via this server (comma/space)
-  GOPROXY_SERVER_<NAME>_EXCLUDE    CIDRs to keep OFF the tunnel (via the original
-                                   gateway) -- e.g. your LAN, so the host stays
-                                   reachable when _DEFAULT routes everything
-  GOPROXY_SERVER_<NAME>_DEFAULT    route ALL traffic via this server (only one)
-  GOPROXY_SERVER_<NAME>_TRANSPORT  aead|tls|udp        (default: GOPROXY_TRANSPORT)
-  GOPROXY_SERVER_<NAME>_PSK        override            (default: GOPROXY_PSK)
-  GOPROXY_SERVER_<NAME>_PRIVATE_KEY client key         (default: GOPROXY_PRIVATE_KEY)
-  GOPROXY_SERVER_<NAME>_SNI        tls SNI             (default: GOPROXY_TLS_SNI)
-  GOPROXY_SERVER_<NAME>_INSECURE   accept self-signed  (default: GOPROXY_TLS_INSECURE)
-  GOPROXY_SERVER_<NAME>_GATEWAY    masquerade LAN into this tunnel
-  GOPROXY_SERVER_<NAME>_IFNAME     TUN device name
-  GOPROXY_SERVER_<NAME>_KEEPALIVE  keepalive seconds   (default: GOPROXY_KEEPALIVE)
+peers (one or more):
+  GOPROXY_PEER_<NAME>              peer's X25519 public key (declares a peer)
+  GOPROXY_PEER_<NAME>_ROUTES       IPv4 CIDRs behind the peer (comma/space):
+                                   packets to them are sent to it, and it may
+                                   only send from them. 0.0.0.0/0 = everything
+  GOPROXY_PEER_<NAME>_IP           tunnel IP handed to the peer when it connects
+                                   (it translates its TUN address to it);
+                                   implies a /32 route. For clients.
+  GOPROXY_PEER_<NAME>_ENDPOINT     host:port -- connect to the peer (otherwise
+                                   only wait for it to connect)
+  GOPROXY_PEER_<NAME>_NAT          true: source-NAT this node's clients' traffic
+                                   to the peer to the node's own address (TCP,
+                                   UDP, ICMP echo; in the node, no iptables)
+                                   (default: false)
+  GOPROXY_PEER_<NAME>_TRANSPORT    for _ENDPOINT        (default: GOPROXY_TRANSPORT)
+  GOPROXY_PEER_<NAME>_PSK          shared secret        (default: GOPROXY_PSK)
+  GOPROXY_PEER_<NAME>_SNI          tls SNI              (default: GOPROXY_TLS_SNI)
+  GOPROXY_PEER_<NAME>_INSECURE     accept self-signed   (default: GOPROXY_TLS_INSECURE)
+  GOPROXY_PEER_<NAME>_KEEPALIVE    cover/keepalive seconds (default: GOPROXY_KEEPALIVE, 25)
 
-  <NAME> is any label without '_' (e.g. DE, US). The unsuffixed GOPROXY_PSK,
-  GOPROXY_PRIVATE_KEY, GOPROXY_TRANSPORT, GOPROXY_TLS_* act as defaults.
-  Example (all traffic via DE, one subnet via US):
-    GOPROXY_SERVER_DE=de.example:443   GOPROXY_SERVER_DE_PUBLIC_KEY=... DE_DEFAULT=true
-    GOPROXY_SERVER_US=us.example:443   GOPROXY_SERVER_US_PUBLIC_KEY=... US_ROUTES="203.0.113.0/24"
+  Each peer needs _ROUTES and/or _IP; a prefix may belong to one peer only.
+  Every packet entering the TUN goes to the peer with the longest matching
+  route; packets matching none (and all IPv6) are BLOCKED (answered with ICMP
+  "administratively prohibited"). The node changes no sysctls or iptables,
+  and host routes only with GOPROXY_PUSH_ROUTES -- see the README.
+  <NAME> is any label without '_' (e.g. DC2, LAPTOP).
+
+examples:
+  exit server:  GOPROXY_LISTEN=0.0.0.0:443 GOPROXY_TUN_ADDRESS=10.8.0.1/24 GOPROXY_MASQUERADE=eth0
+                GOPROXY_PEER_LAPTOP=<pub> GOPROXY_PEER_LAPTOP_IP=10.8.0.2
+  its client:   GOPROXY_PEER_EXIT=<pub> GOPROXY_PEER_EXIT_ENDPOINT=exit.example:443
+                GOPROXY_PEER_EXIT_ROUTES=0.0.0.0/0
+  site mesh:    GOPROXY_LISTEN=0.0.0.0:443 GOPROXY_TUN_ADDRESS=10.1.254.1/24
+                GOPROXY_PEER_DC2=<pub> GOPROXY_PEER_DC2_ENDPOINT=dc2.example:443
+                GOPROXY_PEER_DC2_ROUTES=10.2.0.0/16
 `

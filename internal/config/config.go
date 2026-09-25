@@ -1,12 +1,13 @@
-// Package config builds the server/client configuration entirely from
-// environment variables (there are no config files). See LoadServer/LoadClient
-// for the recognised variables, and the README for a full reference.
+// Package config builds the node configuration entirely from environment
+// variables (there are no config files). See LoadNode for the recognised
+// variables, and the README for a full reference.
 package config
 
 import (
 	"encoding/base64"
 	"fmt"
 	"net"
+	"net/netip"
 	"os"
 	"sort"
 	"strconv"
@@ -17,92 +18,95 @@ import (
 	"goproxy/internal/keys"
 )
 
-// TunnelConfig describes the private tunnel network.
-type TunnelConfig struct {
-	Subnet   string // e.g. "10.8.0.0/24"
-	ServerIP string // e.g. "10.8.0.1"
-}
-
-// TLSServerConfig configures the TLS transport on the server side.
+// TLSServerConfig configures the TLS transport of the listener.
 type TLSServerConfig struct {
 	Cert string // path to PEM cert; empty => self-signed
 	Key  string // path to PEM key
 	Host string // CN/SAN for a generated self-signed cert
 }
 
-// ClientEntry authorizes a single client by its static public key and assigns it
-// a fixed tunnel IP.
-type ClientEntry struct {
-	Name       string
-	PublicKey  string
-	IP         string   // tunnel IP, e.g. "10.8.0.2"
-	AllowedIPs []string // extra CIDRs routed to this client
-}
-
-// ServerConfig is the server role configuration.
-type ServerConfig struct {
-	Listen          string
-	Transport       string // "aead" | "tls"
-	PrivateKey      string
-	PSK             string
-	Tunnel          TunnelConfig
-	MTU             int
-	TLS             TLSServerConfig
-	EgressInterface string // empty => autodetect
-	AutoNAT         bool
-	InterfaceName   string // TUN device name
-	Clients         []ClientEntry
-
-	ObfsMaxPad int  // max random padding per record (traffic-analysis resistance)
-	ObfsCover  bool // send randomised cover traffic
-
-	// Fallback for connections that fail the client handshake (probes/scanners).
-	FallbackMode   string // off | status | redirect | proxy
-	FallbackStatus int    // HTTP status for "status" mode (default 403)
-	FallbackURL    string // Location for "redirect" mode
-	FallbackTarget string // host:port for "proxy" mode
-}
-
-// TLSClientConfig configures the TLS transport on the client side.
+// TLSClientConfig configures the TLS transport when connecting to a peer.
 type TLSClientConfig struct {
 	SNI      string
 	Insecure bool
 }
 
-// ServerConn describes one upstream server the client connects to.
-type ServerConn struct {
-	Name            string // from the GOPROXY_SERVER_<NAME> suffix
-	Address         string // host:port
-	Transport       string
-	PrivateKey      string // this client's static private key for this server
-	ServerPublicKey string
-	PSK             string
-	TLS             TLSClientConfig
-	Routes          []string // CIDRs to route through this server (split tunnel)
-	Exclude         []string // CIDRs to keep OFF the tunnel (via the original gateway)
-	SetDefaultRoute bool     // route all traffic through this server
-	Gateway         bool     // masquerade forwarded LAN traffic into this tunnel
-	InterfaceName   string   // TUN device name
-	KeepaliveSec    int
+// Peer is another node (or a road-warrior client) this node exchanges traffic
+// with. The same description serves both directions: the peer may connect to
+// us, and if Endpoint is set we connect to it as well.
+type Peer struct {
+	Name      string // from the GOPROXY_PEER_<NAME> suffix
+	PublicKey string
+	Routes    []string // IPv4 CIDRs behind the peer (destinations and allowed sources)
+	IP        string   // tunnel IP handed to the peer when it connects; empty = none
+	Endpoint  string   // host:port to connect to; empty = only accept the peer
+	NAT       bool     // translate clients' traffic to the peer to the node's address
+
+	Transport    string // transport used to connect to Endpoint
+	PSK          string
+	TLS          TLSClientConfig
+	KeepaliveSec int
 }
 
-// ParsePrivateKey returns this server connection's client static private key.
-func (s *ServerConn) ParsePrivateKey() (keys.PrivateKey, error) {
-	return keys.ParsePrivateKey(s.PrivateKey)
+// ParsePublicKey returns the peer's static public key.
+func (p *Peer) ParsePublicKey() (keys.PublicKey, error) {
+	return keys.ParsePublicKey(p.PublicKey)
 }
 
-// ParseServerPublicKey returns the server's static public key.
-func (s *ServerConn) ParseServerPublicKey() (keys.PublicKey, error) {
-	return keys.ParsePublicKey(s.ServerPublicKey)
+// Prefixes returns the peer's routes, plus IP/32 when it is handed an IP.
+func (p *Peer) Prefixes() ([]netip.Prefix, error) {
+	var out []netip.Prefix
+	if p.IP != "" {
+		ip, err := netip.ParseAddr(p.IP)
+		if err != nil || !ip.Is4() {
+			return nil, fmt.Errorf("ip %q: need an IPv4 address", p.IP)
+		}
+		out = append(out, netip.PrefixFrom(ip, 32))
+	}
+	for _, cidr := range p.Routes {
+		pfx, err := netip.ParsePrefix(cidr)
+		if err != nil {
+			return nil, fmt.Errorf("route %q: %w", cidr, err)
+		}
+		if !pfx.Addr().Is4() {
+			return nil, fmt.Errorf("route %q: only IPv4 routes are supported", cidr)
+		}
+		out = append(out, pfx.Masked())
+	}
+	return out, nil
 }
 
-// ClientConfig is the client role configuration: one or more servers plus
-// shared settings.
-type ClientConfig struct {
-	Servers    []ServerConn
-	MTU        int
-	ObfsMaxPad int
-	ObfsCover  bool
+// NodeConfig is the whole configuration of a node: its identity, its TUN, an
+// optional listener and its peers.
+type NodeConfig struct {
+	PrivateKey string
+
+	InterfaceName string // TUN device name
+	Address       string // TUN address (IPv4 CIDR)
+	MTU           int    // TUN MTU
+	FwMark        int    // SO_MARK of the node's own connections to peers
+	PushRoutes    string // host routes for the peers' prefixes: false | true | clients
+	Masquerade    string // interface to masquerade the TUN network out of; empty = off
+
+	Listen    string // empty => do not accept connections
+	Transport string // listener transport: aead | tls | udp
+	TLS       TLSServerConfig
+
+	// Fallback for connections that fail the handshake (probes/scanners).
+	FallbackMode   string // off | status | redirect | proxy
+	FallbackStatus int    // HTTP status for "status" mode (default 403)
+	FallbackURL    string // Location for "redirect" mode
+	FallbackTarget string // host:port for "proxy" mode
+
+	ObfsMaxPad int  // max random padding per record (traffic-analysis resistance)
+	ObfsCover  bool // send randomised cover traffic
+
+	Peers []Peer
+}
+
+// ParsePrivateKey returns the node's static private key.
+func (c *NodeConfig) ParsePrivateKey() (keys.PrivateKey, error) {
+	return keys.ParsePrivateKey(c.PrivateKey)
 }
 
 // --- env helpers ---
@@ -155,188 +159,168 @@ func splitList(s string) []string {
 	return out
 }
 
-// loadClients reads the authorized clients from GOPROXY_CLIENT_<NAME> variables.
-// The client name is the suffix; the value is "public_key,ip[,allowed_ips]" with
-// allowed_ips space-separated. Example:
-//
-//	GOPROXY_CLIENT_LAPTOP=pubA=,10.8.0.2
-//	GOPROXY_CLIENT_PC=pubB=,10.8.0.3,192.168.50.0/24 10.0.0.0/8
-func loadClients() ([]ClientEntry, error) {
-	const prefix = "GOPROXY_CLIENT_"
-	var out []ClientEntry
-	for _, kv := range os.Environ() {
-		eq := strings.IndexByte(kv, '=')
-		if eq < 0 {
-			continue
-		}
-		k, v := kv[:eq], kv[eq+1:]
-		if !strings.HasPrefix(k, prefix) {
-			continue
-		}
-		name := k[len(prefix):]
-		if name == "" {
-			continue
-		}
-		fields := strings.Split(v, ",")
-		if len(fields) < 2 {
-			return nil, fmt.Errorf("%s: need public_key,ip[,allowed_ips]", k)
-		}
-		e := ClientEntry{
-			Name:      name,
-			PublicKey: strings.TrimSpace(fields[0]),
-			IP:        strings.TrimSpace(fields[1]),
-		}
-		if len(fields) >= 3 {
-			e.AllowedIPs = splitList(fields[2])
-		}
-		out = append(out, e)
-	}
-	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
-	return out, nil
-}
-
-// LoadServer builds the server config from the environment.
-func LoadServer() (*ServerConfig, error) {
-	c := &ServerConfig{
-		Listen:     env("GOPROXY_LISTEN", ""),
-		Transport:  env("GOPROXY_TRANSPORT", "aead"),
-		PrivateKey: env("GOPROXY_PRIVATE_KEY", ""),
-		PSK:        env("GOPROXY_PSK", ""),
-		Tunnel: TunnelConfig{
-			Subnet:   env("GOPROXY_TUNNEL_SUBNET", "10.8.0.0/24"),
-			ServerIP: env("GOPROXY_TUNNEL_SERVER_IP", "10.8.0.1"),
-		},
-		MTU: envInt("GOPROXY_MTU", 1320),
-		TLS: TLSServerConfig{
-			Cert: env("GOPROXY_TLS_CERT", ""),
-			Key:  env("GOPROXY_TLS_KEY", ""),
-			Host: env("GOPROXY_TLS_HOST", "www.microsoft.com"),
-		},
-		EgressInterface: env("GOPROXY_EGRESS_INTERFACE", ""),
-		AutoNAT:         envBool("GOPROXY_AUTO_NAT", true),
-		InterfaceName:   env("GOPROXY_IFNAME", ""),
-		FallbackMode:    env("GOPROXY_FALLBACK_MODE", "off"),
-		FallbackStatus:  envInt("GOPROXY_FALLBACK_STATUS", 403),
-		FallbackURL:     env("GOPROXY_FALLBACK_URL", ""),
-		FallbackTarget:  env("GOPROXY_FALLBACK_TARGET", ""),
-		ObfsMaxPad:      envInt("GOPROXY_OBFS_MAX_PAD", 255),
-		ObfsCover:       envBool("GOPROXY_OBFS_COVER", true),
-	}
-	clients, err := loadClients()
-	if err != nil {
-		return nil, err
-	}
-	c.Clients = clients
-	return c, c.validate()
-}
-
-// serverNames scans the environment for GOPROXY_SERVER_<NAME> base variables
-// (the address). A key is a base var iff the part after the prefix contains no
-// underscore, so that field vars like GOPROXY_SERVER_DE_ROUTES are not mistaken
-// for a server named "DE_ROUTES". Names are returned sorted for determinism.
-func serverNames() []string {
-	seen := map[string]bool{}
+// peerNames scans the environment for GOPROXY_PEER_<NAME> base variables (the
+// public key). A key is a base var iff the part after the prefix contains no
+// underscore, so that field vars like GOPROXY_PEER_DC2_ROUTES are not mistaken
+// for a peer named "DC2_ROUTES". Names are returned sorted for determinism.
+func peerNames() []string {
 	var names []string
-	const prefix = "GOPROXY_SERVER_"
+	const prefix = "GOPROXY_PEER_"
 	for _, kv := range os.Environ() {
-		eq := strings.IndexByte(kv, '=')
-		if eq < 0 {
+		k, _, _ := strings.Cut(kv, "=")
+		rest, ok := strings.CutPrefix(k, prefix)
+		if !ok || rest == "" || strings.Contains(rest, "_") {
 			continue
 		}
-		k := kv[:eq]
-		if !strings.HasPrefix(k, prefix) {
-			continue
-		}
-		rest := k[len(prefix):]
-		if rest == "" || strings.Contains(rest, "_") {
-			continue // a field var, not a base address var
-		}
-		if !seen[rest] {
-			seen[rest] = true
-			names = append(names, rest)
-		}
+		names = append(names, rest)
 	}
 	sort.Strings(names)
 	return names
 }
 
-// LoadClient builds the client config from the environment. Each server is
-// declared by GOPROXY_SERVER_<NAME> (its address) plus optional
-// GOPROXY_SERVER_<NAME>_<FIELD> variables; unset fields fall back to the global
-// GOPROXY_* defaults.
-func LoadClient() (*ClientConfig, error) {
-	c := &ClientConfig{
-		MTU:        envInt("GOPROXY_MTU", 1320),
-		ObfsMaxPad: envInt("GOPROXY_OBFS_MAX_PAD", 255),
-		ObfsCover:  envBool("GOPROXY_OBFS_COVER", true),
+// LoadNode builds the node config from the environment. Each peer is declared
+// by GOPROXY_PEER_<NAME> (its public key) plus optional GOPROXY_PEER_<NAME>_<FIELD>
+// variables; unset fields fall back to the global GOPROXY_* defaults.
+func LoadNode() (*NodeConfig, error) {
+	c := &NodeConfig{
+		PrivateKey:    env("GOPROXY_PRIVATE_KEY", ""),
+		InterfaceName: env("GOPROXY_IFNAME", "goproxy0"),
+		Address:       env("GOPROXY_TUN_ADDRESS", "10.255.255.1/32"),
+		MTU:           envInt("GOPROXY_MTU", 1320),
+		PushRoutes:    pushRoutes(env("GOPROXY_PUSH_ROUTES", "")),
+		Masquerade:    strings.TrimSpace(env("GOPROXY_MASQUERADE", "")),
+		Listen:        env("GOPROXY_LISTEN", ""),
+		Transport:     env("GOPROXY_TRANSPORT", "aead"),
+		TLS: TLSServerConfig{
+			Cert: env("GOPROXY_TLS_CERT", ""),
+			Key:  env("GOPROXY_TLS_KEY", ""),
+			Host: env("GOPROXY_TLS_HOST", "www.microsoft.com"),
+		},
+		FallbackMode:   env("GOPROXY_FALLBACK_MODE", "off"),
+		FallbackStatus: envInt("GOPROXY_FALLBACK_STATUS", 403),
+		FallbackURL:    env("GOPROXY_FALLBACK_URL", ""),
+		FallbackTarget: env("GOPROXY_FALLBACK_TARGET", ""),
+		ObfsMaxPad:     envInt("GOPROXY_OBFS_MAX_PAD", 255),
+		ObfsCover:      envBool("GOPROXY_OBFS_COVER", true),
 	}
-	gTransport := env("GOPROXY_TRANSPORT", "aead")
-	gPriv := env("GOPROXY_PRIVATE_KEY", "")
+	mark, err := strconv.ParseInt(strings.TrimSpace(env("GOPROXY_FWMARK", "0x676f")), 0, 32)
+	if err != nil || mark <= 0 {
+		return nil, fmt.Errorf("GOPROXY_FWMARK must be a positive integer")
+	}
+	c.FwMark = int(mark)
+
 	gPSK := env("GOPROXY_PSK", "")
 	gSNI := env("GOPROXY_TLS_SNI", "")
 	gInsecure := envBool("GOPROXY_TLS_INSECURE", false)
-	gGateway := envBool("GOPROXY_GATEWAY", false)
 	gKeepalive := envInt("GOPROXY_KEEPALIVE", 25)
 
-	for _, name := range serverNames() {
-		base := "GOPROXY_SERVER_" + name
-		c.Servers = append(c.Servers, ServerConn{
-			Name:            name,
-			Address:         env(base, ""),
-			Transport:       env(base+"_TRANSPORT", gTransport),
-			PrivateKey:      env(base+"_PRIVATE_KEY", gPriv),
-			ServerPublicKey: env(base+"_PUBLIC_KEY", ""),
-			PSK:             env(base+"_PSK", gPSK),
+	for _, name := range peerNames() {
+		base := "GOPROXY_PEER_" + name
+		c.Peers = append(c.Peers, Peer{
+			Name:      name,
+			PublicKey: strings.TrimSpace(env(base, "")),
+			Routes:    splitList(env(base+"_ROUTES", "")),
+			IP:        strings.TrimSpace(env(base+"_IP", "")),
+			Endpoint:  strings.TrimSpace(env(base+"_ENDPOINT", "")),
+			NAT:       envBool(base+"_NAT", false),
+			Transport: env(base+"_TRANSPORT", c.Transport),
+			PSK:       env(base+"_PSK", gPSK),
 			TLS: TLSClientConfig{
 				SNI:      env(base+"_SNI", gSNI),
 				Insecure: envBool(base+"_INSECURE", gInsecure),
 			},
-			Routes:          splitList(env(base+"_ROUTES", "")),
-			Exclude:         splitList(env(base+"_EXCLUDE", "")),
-			SetDefaultRoute: envBool(base+"_DEFAULT", false),
-			Gateway:         envBool(base+"_GATEWAY", gGateway),
-			InterfaceName:   env(base+"_IFNAME", ""),
-			KeepaliveSec:    envInt(base+"_KEEPALIVE", gKeepalive),
+			KeepaliveSec: envInt(base+"_KEEPALIVE", gKeepalive),
 		})
 	}
 	return c, c.validate()
 }
 
-func (c *ServerConfig) validate() error {
-	if c.Listen == "" {
-		return fmt.Errorf("GOPROXY_LISTEN is required")
+// pushRoutes normalises GOPROXY_PUSH_ROUTES: the usual boolean spellings map
+// to "true"/"false"; "clients" is kept; anything else is returned for
+// validate to reject.
+func pushRoutes(v string) string {
+	switch v = strings.ToLower(strings.TrimSpace(v)); v {
+	case "", "0", "false", "no", "off", "n":
+		return "false"
+	case "1", "true", "yes", "on", "y":
+		return "true"
 	}
-	if c.Transport != "aead" && c.Transport != "tls" && c.Transport != "udp" {
-		return fmt.Errorf("GOPROXY_TRANSPORT must be aead, tls or udp")
-	}
+	return v
+}
+
+func validTransport(t string) bool { return t == "aead" || t == "tls" || t == "udp" }
+
+func (c *NodeConfig) validate() error {
 	if _, err := c.ParsePrivateKey(); err != nil {
 		return fmt.Errorf("GOPROXY_PRIVATE_KEY: %w", err)
 	}
-	if c.Tunnel.Subnet == "" || c.Tunnel.ServerIP == "" {
-		return fmt.Errorf("GOPROXY_TUNNEL_SUBNET and GOPROXY_TUNNEL_SERVER_IP are required")
+	if c.InterfaceName == "" {
+		return fmt.Errorf("GOPROXY_IFNAME is empty")
 	}
-	if _, _, err := net.ParseCIDR(c.Tunnel.Subnet); err != nil {
-		return fmt.Errorf("GOPROXY_TUNNEL_SUBNET: %w", err)
+	if p, err := netip.ParsePrefix(c.Address); err != nil || !p.Addr().Is4() {
+		return fmt.Errorf("GOPROXY_TUN_ADDRESS %q: need an IPv4 CIDR, e.g. 10.8.0.1/24", c.Address)
 	}
-	if len(c.Clients) == 0 {
-		return fmt.Errorf("no clients configured (set GOPROXY_CLIENT_<NAME>=pubkey,ip)")
+	if !validTransport(c.Transport) {
+		return fmt.Errorf("GOPROXY_TRANSPORT must be aead, tls or udp")
 	}
-	for _, cl := range c.Clients {
-		if cl.PublicKey == "" || cl.IP == "" {
-			return fmt.Errorf("GOPROXY_CLIENT_%s: needs public_key,ip", cl.Name)
+	if c.PushRoutes != "false" && c.PushRoutes != "true" && c.PushRoutes != "clients" {
+		return fmt.Errorf("GOPROXY_PUSH_ROUTES must be false, true or clients")
+	}
+	if strings.ContainsAny(c.Masquerade, " \t/") || len(c.Masquerade) > 15 {
+		return fmt.Errorf("GOPROXY_MASQUERADE %q: need an interface name, e.g. eth0", c.Masquerade)
+	}
+	if err := c.validateFallback(); err != nil {
+		return err
+	}
+	if len(c.Peers) == 0 {
+		return fmt.Errorf("no peers configured (set GOPROXY_PEER_<NAME>=public_key)")
+	}
+
+	dialing := false
+	owner := map[netip.Prefix]string{}
+	keyOwner := map[keys.PublicKey]string{}
+	for i := range c.Peers {
+		p := &c.Peers[i]
+		pub, err := p.ParsePublicKey()
+		if err != nil {
+			return fmt.Errorf("GOPROXY_PEER_%s: public key: %w", p.Name, err)
 		}
-		if _, err := keys.ParsePublicKey(cl.PublicKey); err != nil {
-			return fmt.Errorf("GOPROXY_CLIENT_%s: %w", cl.Name, err)
+		if other, ok := keyOwner[pub]; ok {
+			return fmt.Errorf("peers %q and %q have the same public key", other, p.Name)
 		}
-		if net.ParseIP(cl.IP) == nil {
-			return fmt.Errorf("GOPROXY_CLIENT_%s: bad ip %q", cl.Name, cl.IP)
+		keyOwner[pub] = p.Name
+
+		prefixes, err := p.Prefixes()
+		if err != nil {
+			return fmt.Errorf("peer %q: %w", p.Name, err)
 		}
-		for _, cidr := range cl.AllowedIPs {
-			if _, _, err := net.ParseCIDR(cidr); err != nil {
-				return fmt.Errorf("GOPROXY_CLIENT_%s allowed ip %q: %w", cl.Name, cidr, err)
+		if len(prefixes) == 0 {
+			return fmt.Errorf("peer %q: set GOPROXY_PEER_%s_ROUTES and/or _IP", p.Name, p.Name)
+		}
+		for _, pfx := range prefixes {
+			if other, ok := owner[pfx]; ok {
+				return fmt.Errorf("route %s is set on both peer %q and %q", pfx, other, p.Name)
+			}
+			owner[pfx] = p.Name
+		}
+
+		if p.Endpoint != "" {
+			dialing = true
+			if _, _, err := net.SplitHostPort(p.Endpoint); err != nil {
+				return fmt.Errorf("peer %q endpoint %q: %w", p.Name, p.Endpoint, err)
+			}
+			if !validTransport(p.Transport) {
+				return fmt.Errorf("peer %q: transport must be aead, tls or udp", p.Name)
 			}
 		}
 	}
+	if c.Listen == "" && !dialing {
+		return fmt.Errorf("nothing to do: set GOPROXY_LISTEN and/or a peer's _ENDPOINT")
+	}
+	return nil
+}
+
+func (c *NodeConfig) validateFallback() error {
 	switch c.FallbackMode {
 	case "", "off", "close", "status":
 	case "redirect":
@@ -354,57 +338,6 @@ func (c *ServerConfig) validate() error {
 		return fmt.Errorf("GOPROXY_FALLBACK_MODE must be off|status|redirect|proxy")
 	}
 	return nil
-}
-
-func (c *ClientConfig) validate() error {
-	if len(c.Servers) == 0 {
-		return fmt.Errorf("no servers configured (set GOPROXY_SERVER_<NAME>=host:port)")
-	}
-	defaults := 0
-	ifnames := map[string]string{}
-	for i := range c.Servers {
-		s := &c.Servers[i]
-		if s.Address == "" {
-			return fmt.Errorf("server %q: GOPROXY_SERVER_%s address is empty", s.Name, s.Name)
-		}
-		if s.Transport != "aead" && s.Transport != "tls" && s.Transport != "udp" {
-			return fmt.Errorf("server %q: transport must be aead, tls or udp", s.Name)
-		}
-		if _, err := s.ParsePrivateKey(); err != nil {
-			return fmt.Errorf("server %q private key: %w", s.Name, err)
-		}
-		if _, err := s.ParseServerPublicKey(); err != nil {
-			return fmt.Errorf("server %q public key: %w", s.Name, err)
-		}
-		for _, cidr := range s.Routes {
-			if _, _, err := net.ParseCIDR(cidr); err != nil {
-				return fmt.Errorf("server %q route %q: %w", s.Name, cidr, err)
-			}
-		}
-		for _, cidr := range s.Exclude {
-			if _, _, err := net.ParseCIDR(cidr); err != nil {
-				return fmt.Errorf("server %q exclude %q: %w", s.Name, cidr, err)
-			}
-		}
-		if s.SetDefaultRoute {
-			defaults++
-		}
-		if s.InterfaceName != "" {
-			if other, ok := ifnames[s.InterfaceName]; ok {
-				return fmt.Errorf("servers %q and %q share interface name %q", other, s.Name, s.InterfaceName)
-			}
-			ifnames[s.InterfaceName] = s.Name
-		}
-	}
-	if defaults > 1 {
-		return fmt.Errorf("only one server may set _DEFAULT=true (%d do)", defaults)
-	}
-	return nil
-}
-
-// ParsePrivateKey returns the server's static private key.
-func (c *ServerConfig) ParsePrivateKey() (keys.PrivateKey, error) {
-	return keys.ParsePrivateKey(c.PrivateKey)
 }
 
 // DerivePSK turns the configured PSK string into a 32-byte key. Empty yields an

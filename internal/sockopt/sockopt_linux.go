@@ -35,3 +35,26 @@ func UDPControl(network, address string, c syscall.RawConn) error {
 		_ = unix.SetsockoptInt(int(fd), unix.IPPROTO_IPV6, unix.IPV6_MTU_DISCOVER, unix.IPV6_PMTUDISC_DONT)
 	})
 }
+
+// MarkedControl wraps a Control hook so the socket is also tagged with SO_MARK
+// (when mark != 0). The client's policy routing sends marked sockets around
+// its own TUN, so the outer tunnel connections never loop back into it.
+func MarkedControl(mark int, next func(network, address string, c syscall.RawConn) error) func(network, address string, c syscall.RawConn) error {
+	return func(network, address string, c syscall.RawConn) error {
+		if next != nil {
+			if err := next(network, address, c); err != nil {
+				return err
+			}
+		}
+		if mark == 0 {
+			return nil
+		}
+		var serr error
+		if err := c.Control(func(fd uintptr) {
+			serr = unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_MARK, mark)
+		}); err != nil {
+			return err
+		}
+		return serr
+	}
+}
