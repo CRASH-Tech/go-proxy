@@ -2,6 +2,7 @@ package node
 
 import (
 	"fmt"
+	"log"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -38,6 +39,7 @@ func newPeer(pc *config.Peer, mark int, tunIP [4]byte) (*peer, error) {
 	p := &peer{cfg: pc, name: pc.Name, pub: pub, psk: config.DerivePSK(pc.PSK)}
 	if pc.NAT {
 		p.nat = nat.New(tunIP)
+		p.nat.Warn = func(msg string) { log.Printf("[%s] warning: %s", pc.Name, msg) }
 	}
 	if pc.Endpoint != "" {
 		switch pc.Transport {

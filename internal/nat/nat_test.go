@@ -2,6 +2,7 @@ package nat
 
 import (
 	"encoding/binary"
+	"strings"
 	"testing"
 	"time"
 
@@ -112,8 +113,8 @@ func TestRoundTrip(t *testing.T) {
 				t.Fatalf("src = %s", ipx.SrcIP(pkt))
 			}
 			sport, _ := ports(pkt)
-			if sport < tb.lo || sport > tb.hi {
-				t.Fatalf("translated port %d outside %d-%d", sport, tb.lo, tb.hi)
+			if !tb.inSpans(sport) {
+				t.Fatalf("translated port %d outside %v", sport, tb.spans)
 			}
 
 			reply := tc.back(sport)
@@ -242,7 +243,7 @@ func TestExpire(t *testing.T) {
 
 func TestFull(t *testing.T) {
 	tb := New(node)
-	tb.lo, tb.hi, tb.next = 61000, 61001, 61000
+	tb.setSpans([][2]uint16{{61000, 61001}})
 	for i := uint16(0); i < 2; i++ {
 		if !tb.Out(packet(protoUDP, client, remote, udp(1000+i, 53))) {
 			t.Fatal("dropped while ports are free")
@@ -278,5 +279,160 @@ func TestPeerOpenedFlowUntranslated(t *testing.T) {
 	tb.Out(other)
 	if ipx.SrcIP(other).String() != "10.255.255.1" {
 		t.Fatal("a client-opened flow was not translated")
+	}
+}
+
+// connect runs a whole TCP connection from the client through tb: handshake,
+// data, and a graceful close from both sides.
+func connect(t *testing.T, tb *Table, sport uint16) bool {
+	t.Helper()
+	send := func(flags byte) (uint16, bool) {
+		p := packet(protoTCP, client, remote, tcp(sport, 443, flags))
+		if !tb.Out(p) {
+			return 0, false
+		}
+		n, _ := ports(p)
+		return n, true
+	}
+	recv := func(nport uint16, flags byte) { tb.In(packet(protoTCP, remote, node, tcp(443, nport, flags))) }
+
+	n, ok := send(0x02) // SYN
+	if !ok {
+		return false
+	}
+	recv(n, 0x12) // SYN-ACK
+	send(0x10)    // ACK
+	send(0x18)    // data
+	recv(n, 0x18) // data
+	send(0x11)    // FIN-ACK
+	recv(n, 0x11) // FIN-ACK
+	send(0x10)    // final ACK
+	return true
+}
+
+func TestClosedTCPReleasesPortSoon(t *testing.T) {
+	tb := New(node)
+	connect(t, tb, 40000)
+	tb.mu.Lock()
+	defer tb.mu.Unlock()
+	for _, e := range tb.out {
+		if left := time.Until(e.expires); left > 2*tcpDoneTimeout {
+			t.Fatalf("a closed connection keeps its port for %s", left.Round(time.Minute))
+		}
+	}
+}
+
+func TestManyShortConnectionsToOneEndpoint(t *testing.T) {
+	tb := New(node)
+	tb.setSpans([][2]uint16{{61000, 61003}}) // 4 ports
+	for i := 0; i < 50; i++ {
+		if !connect(t, tb, uint16(40000+i)) {
+			t.Fatalf("connection %d dropped: ports of closed connections are not reused", i+1)
+		}
+		// Time passes between connections: closed ones become reclaimable.
+		tb.mu.Lock()
+		for _, e := range tb.out {
+			if e.closing {
+				e.expires = time.Now().Add(-time.Second)
+			}
+		}
+		tb.mu.Unlock()
+	}
+}
+
+// expiry returns how long the only mapping in tb has left.
+func expiry(t *testing.T, tb *Table) time.Duration {
+	t.Helper()
+	tb.mu.Lock()
+	defer tb.mu.Unlock()
+	if len(tb.out) != 1 {
+		t.Fatalf("%d mappings, want 1", len(tb.out))
+	}
+	for _, e := range tb.out {
+		return time.Until(e.expires).Round(time.Second)
+	}
+	return 0
+}
+
+func TestTimeoutsByState(t *testing.T) {
+	// A DNS-like exchange: one query, one answer.
+	tb := New(node)
+	q := packet(protoUDP, client, remote, udp(5353, 53))
+	tb.Out(q)
+	n, _ := ports(q)
+	tb.In(packet(protoUDP, remote, node, udp(53, n)))
+	if d := expiry(t, tb); d != udpTimeout {
+		t.Fatalf("one-off UDP exchange: %s, want %s", d, udpTimeout)
+	}
+	// The client sends again: a stream.
+	tb.Out(packet(protoUDP, client, remote, udp(5353, 53)))
+	if d := expiry(t, tb); d != udpStreamTimeout {
+		t.Fatalf("UDP stream: %s, want %s", d, udpStreamTimeout)
+	}
+
+	// A SYN nobody answers.
+	tb = New(node)
+	tb.Out(packet(protoTCP, client, remote, tcp(40000, 443, 0x02)))
+	if d := expiry(t, tb); d != tcpOpenTimeout {
+		t.Fatalf("unanswered SYN: %s, want %s", d, tcpOpenTimeout)
+	}
+}
+
+func TestExhaustionWarnsOnce(t *testing.T) {
+	tb := New(node)
+	tb.setSpans([][2]uint16{{61000, 61000}}) // 1 port
+	warned := make(chan string, 10)
+	tb.Warn = func(msg string) { warned <- msg }
+	tb.Out(packet(protoTCP, client, remote, tcp(40000, 443, 0x02)))
+	for i := 0; i < 5; i++ {
+		if tb.Out(packet(protoTCP, client, remote, tcp(uint16(40001+i), 443, 0x02))) {
+			t.Fatal("a flow got a port that is in use")
+		}
+	}
+	select {
+	case msg := <-warned:
+		if !strings.Contains(msg, "198.51.100.1:443") {
+			t.Fatalf("warning %q does not name the endpoint", msg)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("no warning")
+	}
+	time.Sleep(50 * time.Millisecond)
+	if len(warned) != 0 {
+		t.Fatalf("%d more warnings within a minute", len(warned))
+	}
+}
+
+func TestPortSpansAvoidEphemeral(t *testing.T) {
+	tb := New(node)
+	if tb.size < 30000 {
+		t.Fatalf("only %d ports: %v", tb.size, tb.spans)
+	}
+	if tb.inSpans(40000) || tb.inSpans(80) || !tb.inSpans(1024) || !tb.inSpans(65535) {
+		t.Fatalf("spans %v overlap the ephemeral or privileged ports", tb.spans)
+	}
+	// Two spans: every index maps to a distinct port inside them.
+	tb.setSpans([][2]uint16{{2000, 2001}, {3000, 3000}})
+	got := []uint16{tb.portAt(0), tb.portAt(1), tb.portAt(2)}
+	if got[0] != 2000 || got[1] != 2001 || got[2] != 3000 || tb.size != 3 {
+		t.Fatalf("portAt = %v, size %d", got, tb.size)
+	}
+}
+
+func TestClosingPortTakenWhenFull(t *testing.T) {
+	tb := New(node)
+	tb.setSpans([][2]uint16{{61000, 61001}}) // 2 ports
+	connect(t, tb, 40000)                    // closed: closing, not expired yet
+	connect(t, tb, 40001)
+	// Both ports belong to closing connections; a new one takes the oldest.
+	if !connect(t, tb, 40002) {
+		t.Fatal("new connection dropped although closing ports could be reused")
+	}
+	// A live connection is never taken over.
+	tb = New(node)
+	tb.setSpans([][2]uint16{{61000, 61000}})
+	tb.Out(packet(protoTCP, client, remote, tcp(40000, 443, 0x02)))
+	if tb.Out(packet(protoTCP, client, remote, tcp(40001, 443, 0x02))) {
+		t.Fatal("a live connection's port was taken over")
 	}
 }

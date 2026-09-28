@@ -14,6 +14,8 @@ package nat
 
 import (
 	"encoding/binary"
+	"fmt"
+	"net/netip"
 	"os"
 	"strconv"
 	"strings"
@@ -29,16 +31,73 @@ const (
 	protoUDP  = 17
 
 	tcpFIN = 0x01
+	tcpSYN = 0x02
 	tcpRST = 0x04
+	tcpACK = 0x10
 )
 
-// Idle timeouts of a mapping.
+// Idle timeouts of a mapping, by the state of its flow (as conntrack does).
 const (
-	tcpTimeout     = time.Hour
-	tcpDoneTimeout = time.Minute // after FIN or RST
-	udpTimeout     = 3 * time.Minute
-	icmpTimeout    = 30 * time.Second
+	tcpTimeout       = time.Hour        // established
+	tcpOpenTimeout   = 2 * time.Minute  // no reply yet
+	tcpDoneTimeout   = time.Minute      // after FIN or RST from either side
+	udpTimeout       = 30 * time.Second // one-off exchanges, e.g. a DNS query
+	udpStreamTimeout = 3 * time.Minute  // traffic both ways, more than once
+	icmpTimeout      = 30 * time.Second
 )
+
+// life tracks the state of a flow and when its mapping expires. Once a TCP
+// flow is closing it stays so -- the final ACK after a FIN must not put it
+// back to the established timeout -- until a new SYN reuses the ports.
+type life struct {
+	expires time.Time
+	replied bool // a packet came back from the side that did not open the flow
+	stream  bool // UDP: the opening side sent again after a reply
+	closing bool // TCP: FIN or RST seen
+}
+
+// touch updates the state for a packet of the flow, sent by the side that
+// opened it (opener) or by the other one, and extends the expiry.
+func (l *life) touch(pkt []byte, ihl int, opener bool, now time.Time) {
+	var d time.Duration
+	switch pkt[9] {
+	case protoTCP:
+		flags := byte(0)
+		if len(pkt) >= ihl+14 {
+			flags = pkt[ihl+13]
+		}
+		if opener && flags&tcpSYN != 0 && flags&tcpACK == 0 { // a new connection on these ports
+			*l = life{}
+		}
+		if !opener {
+			l.replied = true
+		}
+		if flags&(tcpFIN|tcpRST) != 0 {
+			l.closing = true
+		}
+		switch {
+		case l.closing:
+			d = tcpDoneTimeout
+		case !l.replied:
+			d = tcpOpenTimeout
+		default:
+			d = tcpTimeout
+		}
+	case protoUDP:
+		if !opener {
+			l.replied = true
+		} else if l.replied {
+			l.stream = true
+		}
+		d = udpTimeout
+		if l.stream {
+			d = udpStreamTimeout
+		}
+	default:
+		d = icmpTimeout
+	}
+	l.expires = now.Add(d)
+}
 
 // maxEntries bounds the table; new flows beyond it are dropped.
 const maxEntries = 65536
@@ -61,34 +120,68 @@ type reply struct {
 }
 
 type entry struct {
-	f       flow
-	port    uint16
-	expires time.Time
+	life
+	f    flow
+	port uint16
 }
 
 // Table translates the flows of one peer.
 type Table struct {
-	addr   [4]byte // the node's address, which clients' flows leave with
-	lo, hi uint16  // translated port range
+	addr  [4]byte     // the node's address, which clients' flows leave with
+	spans [][2]uint16 // translated port ranges (inclusive)
+	size  int         // number of ports in spans
 
-	mu   sync.Mutex
-	out  map[flow]*entry
-	in   map[reply]*entry
-	pass map[flow]time.Time // flows opened from the peer side (as the client replies), with expiry
-	next uint16
+	// Warn, if set, is told (at most once a minute) when flows are dropped
+	// because no port is left.
+	Warn func(string)
+
+	mu       sync.Mutex
+	out      map[flow]*entry
+	in       map[reply]*entry
+	pass     map[flow]*life // flows opened from the peer side, keyed as the client replies
+	next     int            // allocation cursor, an index into spans
+	lastWarn time.Time
 }
 
 // New returns a table translating to addr, with ports outside the host's
 // ephemeral range so they never clash with the host's own sockets.
 func New(addr [4]byte) *Table {
-	lo, hi := portRange()
-	return &Table{addr: addr, lo: lo, hi: hi, next: lo,
-		out: map[flow]*entry{}, in: map[reply]*entry{}, pass: map[flow]time.Time{}}
+	t := &Table{addr: addr, out: map[flow]*entry{}, in: map[reply]*entry{}, pass: map[flow]*life{}}
+	t.setSpans(portSpans())
+	return t
 }
 
-// portRange picks the translated ports: above the ephemeral range if there is
-// room (61000-65535 by default), otherwise below it.
-func portRange() (uint16, uint16) {
+func (t *Table) setSpans(spans [][2]uint16) {
+	t.spans, t.size, t.next = spans, 0, 0
+	for _, sp := range spans {
+		t.size += int(sp[1]) - int(sp[0]) + 1
+	}
+}
+
+// portAt returns the i-th translated port.
+func (t *Table) portAt(i int) uint16 {
+	for _, sp := range t.spans {
+		n := int(sp[1]) - int(sp[0]) + 1
+		if i < n {
+			return sp[0] + uint16(i)
+		}
+		i -= n
+	}
+	return 0
+}
+
+func (t *Table) inSpans(p uint16) bool {
+	for _, sp := range t.spans {
+		if p >= sp[0] && p <= sp[1] {
+			return true
+		}
+	}
+	return false
+}
+
+// portSpans picks the translated ports: everything outside the host's
+// ephemeral range (1024-32767 and 61000-65535 by default).
+func portSpans() [][2]uint16 {
 	elo, ehi := 32768, 60999
 	if b, err := os.ReadFile("/proc/sys/net/ipv4/ip_local_port_range"); err == nil {
 		if f := strings.Fields(string(b)); len(f) == 2 {
@@ -99,13 +192,17 @@ func portRange() (uint16, uint16) {
 			}
 		}
 	}
-	if 65535-ehi >= 1024 {
-		return uint16(ehi + 1), 65535
+	var spans [][2]uint16
+	if elo-1 >= 1024 {
+		spans = append(spans, [2]uint16{1024, uint16(elo - 1)})
 	}
-	if elo-1024 >= 1024 {
-		return 1024, uint16(elo - 1)
+	if ehi+1 <= 65535 {
+		spans = append(spans, [2]uint16{uint16(ehi + 1), 65535})
 	}
-	return 61000, 65535
+	if len(spans) == 0 { // the ephemeral range covers everything: share it
+		spans = [][2]uint16{{61000, 65535}}
+	}
+	return spans
 }
 
 // Out translates a packet from a client to the peer, in place. Packets from the
@@ -124,20 +221,25 @@ func (t *Table) Out(pkt []byte) bool {
 	now := time.Now()
 
 	t.mu.Lock()
-	if _, ok := t.pass[f]; ok {
+	if l := t.pass[f]; l != nil && now.Before(l.expires) {
 		// A reply to a flow the peer side opened: leave it as it is.
-		t.pass[f] = now.Add(timeout(pkt, ihl))
+		l.touch(pkt, ihl, false, now)
 		t.mu.Unlock()
 		return true
 	}
 	e := t.out[f]
+	if e != nil && now.After(e.expires) {
+		t.drop(e) // expired but not collected yet: start afresh
+		e = nil
+	}
 	if e == nil {
-		if len(t.out) >= maxEntries {
-			t.mu.Unlock()
-			return false
+		var port uint16
+		ok := len(t.out) < maxEntries
+		if ok {
+			port, ok = t.allocate(f, now)
 		}
-		port, ok := t.allocate(f)
 		if !ok {
+			t.exhausted(f, now)
 			t.mu.Unlock()
 			return false
 		}
@@ -145,7 +247,7 @@ func (t *Table) Out(pkt []byte) bool {
 		t.out[f] = e
 		t.in[reply{f.proto, port, f.dst, f.dport}] = e
 	}
-	e.expires = now.Add(timeout(pkt, ihl))
+	e.touch(pkt, ihl, true, now)
 	port := e.port
 	t.mu.Unlock()
 
@@ -174,13 +276,14 @@ func (t *Table) In(pkt []byte) bool {
 		return false
 	}
 
+	now := time.Now()
 	t.mu.Lock()
 	e := t.in[r]
-	if e == nil {
+	if e == nil || now.After(e.expires) {
 		t.mu.Unlock()
 		return false
 	}
-	e.expires = time.Now().Add(timeout(pkt, ihl))
+	e.touch(pkt, ihl, false, now)
 	f := e.f
 	t.mu.Unlock()
 
@@ -251,11 +354,18 @@ func (t *Table) remember(pkt []byte, ihl int) {
 		dst:   [4]byte(pkt[12:16]),
 		dport: binary.BigEndian.Uint16(l4[0:2]),
 	}
+	now := time.Now()
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	if _, ok := t.pass[f]; ok || len(t.pass) < maxEntries {
-		t.pass[f] = time.Now().Add(timeout(pkt, ihl))
+	l := t.pass[f]
+	if l == nil {
+		if len(t.pass) >= maxEntries {
+			return
+		}
+		l = &life{}
+		t.pass[f] = l
 	}
+	l.touch(pkt, ihl, true, now)
 }
 
 // Expire drops mappings idle past their timeout.
@@ -263,17 +373,37 @@ func (t *Table) Expire() {
 	now := time.Now()
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	for f, e := range t.out {
+	for _, e := range t.out {
 		if now.After(e.expires) {
-			delete(t.out, f)
-			delete(t.in, reply{f.proto, e.port, f.dst, f.dport})
+			t.drop(e)
 		}
 	}
-	for f, exp := range t.pass {
-		if now.After(exp) {
+	for f, l := range t.pass {
+		if now.After(l.expires) {
 			delete(t.pass, f)
 		}
 	}
+}
+
+// drop removes a mapping. Called with t.mu held.
+func (t *Table) drop(e *entry) {
+	delete(t.out, e.f)
+	delete(t.in, reply{e.f.proto, e.port, e.f.dst, e.f.dport})
+}
+
+// exhausted reports, at most once a minute, that a flow was dropped for lack
+// of ports. Called with t.mu held.
+func (t *Table) exhausted(f flow, now time.Time) {
+	if t.Warn == nil || now.Sub(t.lastWarn) < time.Minute {
+		return
+	}
+	t.lastWarn = now
+	msg := fmt.Sprintf("NAT table full (%d flows): new connections are dropped", len(t.out))
+	if len(t.out) < maxEntries {
+		msg = fmt.Sprintf("NAT: all %d ports towards %s:%d are in use: new connections to it are dropped",
+			t.size, netip.AddrFrom4(f.dst), f.dport)
+	}
+	go t.Warn(msg)
 }
 
 // Len returns the number of mappings.
@@ -284,28 +414,40 @@ func (t *Table) Len() int {
 }
 
 // allocate picks a translated port for f that is unused towards f's remote
-// endpoint, preferring the client's own port. Called with t.mu held.
-func (t *Table) allocate(f flow) (uint16, bool) {
+// endpoint, preferring the client's own port. A port whose mapping has expired
+// but not been collected yet is taken over, and if none is left, the port of
+// the oldest closing connection to the same endpoint. Called with t.mu held.
+func (t *Table) allocate(f flow, now time.Time) (uint16, bool) {
 	free := func(p uint16) bool {
-		_, used := t.in[reply{f.proto, p, f.dst, f.dport}]
-		return !used
+		e := t.in[reply{f.proto, p, f.dst, f.dport}]
+		if e != nil && now.After(e.expires) {
+			t.drop(e)
+			e = nil
+		}
+		return e == nil
 	}
-	if f.sport >= t.lo && f.sport <= t.hi && free(f.sport) {
+	if t.inSpans(f.sport) && free(f.sport) {
 		return f.sport, true
 	}
-	n := int(t.hi) - int(t.lo) + 1
-	for i := 0; i < n; i++ {
-		p := t.next
-		if t.next == t.hi {
-			t.next = t.lo
-		} else {
-			t.next++
-		}
+	for i := 0; i < t.size; i++ {
+		p := t.portAt(t.next)
+		t.next = (t.next + 1) % t.size
 		if free(p) {
 			return p, true
 		}
 	}
-	return 0, false
+	var oldest *entry
+	for _, e := range t.out {
+		if e.closing && e.f.proto == f.proto && e.f.dst == f.dst && e.f.dport == f.dport &&
+			(oldest == nil || e.expires.Before(oldest.expires)) {
+			oldest = e
+		}
+	}
+	if oldest == nil {
+		return 0, false
+	}
+	t.drop(oldest)
+	return oldest.port, true
 }
 
 // header validates an IPv4 header and returns its length.
@@ -371,20 +513,6 @@ func replyOf(pkt []byte, ihl int) (reply, bool) {
 		return r, false
 	}
 	return r, true
-}
-
-// timeout returns how long a mapping stays after this packet.
-func timeout(pkt []byte, ihl int) time.Duration {
-	switch pkt[9] {
-	case protoTCP:
-		if len(pkt) >= ihl+14 && pkt[ihl+13]&(tcpFIN|tcpRST) != 0 {
-			return tcpDoneTimeout
-		}
-		return tcpTimeout
-	case protoUDP:
-		return udpTimeout
-	}
-	return icmpTimeout
 }
 
 // l4Sum returns the offset of the checksum in the L4 header and whether the

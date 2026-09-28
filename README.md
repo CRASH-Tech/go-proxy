@@ -142,9 +142,15 @@ let its road warriors reach another site that has no route to them.
   and port the flow was opened to. Connections the peer side opens *to* a
   client are left untranslated, replies included (the client stays reachable
   by its real address wherever the peer can route to it).
-- Translated ports lie outside the host's `ip_local_port_range`
-  (61000–65535 by default), so they never clash with the node's own sockets.
-  Idle mappings expire (TCP 1 h, 1 min after FIN/RST; UDP 3 min; ICMP 30 s).
+- Translated ports lie outside the host's `ip_local_port_range` (1024–32767
+  and 61000–65535 by default, ~36 000 per remote address and port), so they
+  never clash with the node's own sockets.
+- Mappings follow the connection's state, like conntrack: TCP 2 min until
+  answered, 1 h established, 1 min once closing (FIN/RST); UDP 30 s for one-off
+  exchanges (a DNS query), 3 min for streams; ICMP 30 s. If every port towards
+  one address and port is still taken, the oldest closing connection's port is
+  reused; only if none is closing is the new connection dropped, with a
+  warning in the log.
 - The node's own traffic is never translated. Other protocols and non-first
   IP fragments pass unchanged.
 
