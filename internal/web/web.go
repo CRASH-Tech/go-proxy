@@ -53,6 +53,7 @@ type Server struct {
 	passHash [32]byte
 	signKey  [32]byte // signs session tokens
 	secure   bool     // served over TLS: mark the cookie Secure
+	base     string   // GOPROXY_WEB_PATH ("/secret") or ""
 
 	mu      sync.Mutex
 	revoked map[string]time.Time // logged-out tokens -> their expiry
@@ -69,6 +70,7 @@ func NewServer(cfg *config.NodeConfig, n *node.Node, restart func()) *Server {
 		passHash: sha256.Sum256([]byte(cfg.WebPassword)),
 		signKey:  sha256.Sum256([]byte("goproxy-web-session\x00" + cfg.WebPassword)),
 		secure:   cfg.WebTLS,
+		base:     cfg.WebPath,
 		revoked:  map[string]time.Time{},
 	}
 }
@@ -100,7 +102,7 @@ func Start(cfg *config.NodeConfig, n *node.Node, restart func()) (func(), error)
 			log.Printf("web UI: %v", err)
 		}
 	}()
-	log.Printf("web UI on %s://%s", scheme, cfg.WebListen)
+	log.Printf("web UI on %s://%s%s/", scheme, cfg.WebListen, cfg.WebPath)
 	return func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer cancel()
@@ -127,8 +129,26 @@ func (s *Server) Handler() http.Handler {
 	api("POST /api/peers", s.addPeer)
 	api("PUT /api/peers/{name}", s.updatePeer)
 	api("DELETE /api/peers/{name}", s.deletePeer)
-	return headers(mux)
+	if s.base == "" {
+		return headers(mux)
+	}
+	// Only under the base path; anything else is a bare 404, so the UI's
+	// existence is not given away.
+	inner := http.StripPrefix(s.base, headers(mux))
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasPrefix(r.URL.Path, s.base+"/"):
+			inner.ServeHTTP(w, r)
+		case r.URL.Path == s.base:
+			http.Redirect(w, r, s.base+"/", http.StatusFound)
+		default:
+			http.NotFound(w, r)
+		}
+	})
 }
+
+// cookiePath scopes the session cookie to the UI.
+func (s *Server) cookiePath() string { return s.base + "/" }
 
 // headers adds security headers to every response.
 func headers(next http.Handler) http.Handler {
@@ -225,7 +245,7 @@ func (s *Server) login(w http.ResponseWriter, r *http.Request) {
 	}
 	token := s.newToken(time.Now().Add(sessionTTL))
 	http.SetCookie(w, &http.Cookie{
-		Name: cookieName, Value: token, Path: "/", MaxAge: int(sessionTTL.Seconds()),
+		Name: cookieName, Value: token, Path: s.cookiePath(), MaxAge: int(sessionTTL.Seconds()),
 		HttpOnly: true, SameSite: http.SameSiteStrictMode, Secure: s.secure,
 	})
 	writeJSON(w, map[string]bool{"ok": true})
@@ -245,7 +265,7 @@ func (s *Server) logout(w http.ResponseWriter, r *http.Request) {
 			s.mu.Unlock()
 		}
 	}
-	http.SetCookie(w, &http.Cookie{Name: cookieName, Value: "", Path: "/", MaxAge: -1,
+	http.SetCookie(w, &http.Cookie{Name: cookieName, Value: "", Path: s.cookiePath(), MaxAge: -1,
 		HttpOnly: true, SameSite: http.SameSiteStrictMode, Secure: s.secure})
 	writeJSON(w, map[string]bool{"ok": true})
 }

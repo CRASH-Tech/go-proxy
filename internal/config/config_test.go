@@ -238,3 +238,11 @@ func TestDisabledPeerSharesRoutes(t *testing.T) {
 		t.Fatal("two enabled peers with the same route accepted")
 	}
 }
+
+func TestWebPath(t *testing.T) {
+	for in, want := range map[string]string{"": "", "/": "", "k7Qm": "/k7Qm", "/a/b/": "/a/b", " x ": "/x"} {
+		if got := webPath(in); got != want {
+			t.Errorf("webPath(%q) = %q, want %q", in, got, want)
+		}
+	}
+}

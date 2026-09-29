@@ -514,6 +514,7 @@ and the [connection log](#connection-log):
 GOPROXY_WEB_LISTEN=127.0.0.1:8080      # where the page is served
 GOPROXY_WEB_PASSWORD=a-long-password   # required
 GOPROXY_WEB_TLS=true                   # optional: HTTPS with a self-signed certificate
+GOPROXY_WEB_PATH=k7Qm2xVd              # optional: serve the page only under /k7Qm2xVd/
 GOPROXY_DATA_DIR=/var/lib/goproxy      # where peers added in the UI are kept
 ```
 
@@ -540,10 +541,10 @@ GOPROXY_DATA_DIR=/var/lib/goproxy      # where peers added in the UI are kept
   `GOPROXY_PRIVATE_KEY`: it is generated on first start (`node.key`), shown
   on the page, and can be replaced there — generated anew or pasted (e.g. to
   move a node to another host). A key from the environment is shown read-only.
-- **New peers:** *Сгенерировать пару* creates the peer's key pair, *Свободный IP*
+- **New peers:** *Generate key pair* creates the peer's key pair, *Next free*
   picks the next unused address of the TUN network, and after saving the page
   shows the peer's side of the configuration (env or docker-compose) with its
-  private key — shown once and not stored on the node. *Конфиг* on any peer
+  private key — shown once and not stored on the node. *Config* on any peer
   shows it again, with a placeholder for the key.
 - **Security:** a login gives an `HttpOnly`, `SameSite=Strict` session cookie
   (12 h, survives a restart of the node, ends with a password change); changes need a JSON request with the `X-Goproxy` header, so another
@@ -552,6 +553,11 @@ GOPROXY_DATA_DIR=/var/lib/goproxy      # where peers added in the UI are kept
   address rather than a public one (or put it behind a reverse proxy), and use
   `GOPROXY_WEB_TLS=true` when the password crosses a network. The data
   directory holds secrets (the key, PSKs) and is written with mode 0600.
+- **Hidden path:** with `GOPROXY_WEB_PATH` set the page and its API are served
+  only under that path (`https://host:8080/k7Qm2xVd/`); every other URL,
+  including `/`, is a plain 404, so a scan does not find a login form. The
+  path is not a password — it shows in browser history and proxy logs — but
+  keeps the page out of sight. Letters, digits, `-._~` and `/`.
 
 With Docker, keep the data directory on a volume:
 

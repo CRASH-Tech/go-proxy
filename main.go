@@ -246,6 +246,8 @@ web UI (optional):
   GOPROXY_WEB_PASSWORD       its password                     [required with it]
   GOPROXY_WEB_TLS            serve it over HTTPS with a self-signed certificate
                              (default: false)
+  GOPROXY_WEB_PATH           serve it only under this path, e.g. k7Qm2xVd;
+                             any other URL is a 404         (default: at /)
   Peers added in the UI are saved in GOPROXY_DATA_DIR and applied at once;
   peers from the environment are shown read-only. These settings can be made
   in the UI too, when the environment leaves them unset: GOPROXY_NAME,

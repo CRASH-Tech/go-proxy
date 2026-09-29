@@ -53,12 +53,16 @@ func setup(t *testing.T) (*client, *node.Node) {
 // setupWith starts the UI for a node (not running) whose config is loaded
 // from the environment given by env; restarts counts requested restarts.
 func setupWith(t *testing.T, restarts *int) (*client, *node.Node, *config.NodeConfig) {
+	return setupPath(t, restarts, "")
+}
+
+func setupPath(t *testing.T, restarts *int, path string) (*client, *node.Node, *config.NodeConfig) {
 	t.Helper()
 	cfg := &config.NodeConfig{
 		Name: "HOME", DataDir: t.TempDir(), InterfaceName: "goproxy0", Address: "10.8.0.1/24",
 		MTU: 1320, Transport: "udp", PushRoutes: "false", FwMark: 0x676f, DefaultKeepalive: 25,
-		WebPassword: "s3cret",
-		Sources:     map[string]string{"GOPROXY_TUN_ADDRESS": "env"},
+		WebPassword: "s3cret", WebPath: path,
+		Sources: map[string]string{"GOPROXY_TUN_ADDRESS": "env"},
 	}
 	env := config.Peer{Name: "EXIT", PublicKey: pub(t), Routes: []string{"0.0.0.0/0"}}
 	cfg.ApplyDefaults(&env)
@@ -261,5 +265,60 @@ func TestNodeKey(t *testing.T) {
 	}
 	if code, out := c.do("POST", "/api/node/key", "", true); code != 200 || out["public_key"] == k.Public().String() {
 		t.Fatalf("generate: %d %v", code, out)
+	}
+}
+
+func TestWebPath(t *testing.T) {
+	c, _, _ := setupPath(t, nil, "/k7Qm")
+	root := c.base
+	for _, p := range []string{"/", "/index.html", "/app.js", "/api/state", "/k7", "/k7Qmx/", "/x/k7Qm/"} {
+		res, err := http.Get(root + p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		res.Body.Close()
+		if res.StatusCode != http.StatusNotFound || res.Header.Get("Content-Security-Policy") != "" {
+			t.Fatalf("GET %s: %d, want a bare 404", p, res.StatusCode)
+		}
+	}
+	if code, _ := c.do("POST", "/api/login", `{"password":"s3cret"}`, true); code != http.StatusNotFound {
+		t.Fatalf("login outside the path: %d", code)
+	}
+
+	noFollow := &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+	res, err := noFollow.Get(root + "/k7Qm")
+	if err != nil {
+		t.Fatal(err)
+	}
+	res.Body.Close()
+	if res.StatusCode != http.StatusFound || res.Header.Get("Location") != "/k7Qm/" {
+		t.Fatalf("GET /k7Qm: %d -> %q", res.StatusCode, res.Header.Get("Location"))
+	}
+	for _, p := range []string{"/k7Qm/", "/k7Qm/app.js"} {
+		res, err := http.Get(root + p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		res.Body.Close()
+		if res.StatusCode != 200 {
+			t.Fatalf("GET %s: %d", p, res.StatusCode)
+		}
+	}
+
+	c.base = root + "/k7Qm"
+	req, _ := http.NewRequest("POST", c.base+"/api/login", strings.NewReader(`{"password":"s3cret"}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Goproxy", "1")
+	res, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	res.Body.Close()
+	if ck := res.Header.Get("Set-Cookie"); !strings.Contains(ck, "Path=/k7Qm/") {
+		t.Fatalf("cookie %q, want Path=/k7Qm/", ck)
+	}
+	c.do("POST", "/api/login", `{"password":"s3cret"}`, true)
+	if code, _ := c.do("GET", "/api/state", "", false); code != http.StatusOK {
+		t.Fatalf("state under the path: %d", code)
 	}
 }

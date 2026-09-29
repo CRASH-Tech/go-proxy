@@ -91,6 +91,7 @@ type NodeConfig struct {
 	DataDir    string // where web-managed peers and a generated key are kept; empty = none
 
 	WebListen   string // address of the web UI; empty = off
+	WebPath     string // serve the web UI only under this path ("/secret"); empty = at /
 	WebPassword string
 	WebTLS      bool // serve the web UI over HTTPS with a self-signed certificate
 
@@ -284,6 +285,7 @@ func LoadNodeWith(settings map[string]string) (*NodeConfig, error) {
 		Name:          strings.TrimSpace(env("GOPROXY_NAME", "")),
 		DataDir:       strings.TrimSpace(env("GOPROXY_DATA_DIR", "")),
 		WebListen:     strings.TrimSpace(env("GOPROXY_WEB_LISTEN", "")),
+		WebPath:       webPath(env("GOPROXY_WEB_PATH", "")),
 		WebPassword:   env("GOPROXY_WEB_PASSWORD", ""),
 		WebTLS:        envBool("GOPROXY_WEB_TLS", false),
 		InterfaceName: env("GOPROXY_IFNAME", "goproxy0"),
@@ -375,6 +377,15 @@ func defaultName() string {
 	return name
 }
 
+// webPath normalises GOPROXY_WEB_PATH to "/a/b" (or "" for none).
+func webPath(v string) string {
+	v = strings.Trim(strings.TrimSpace(v), "/")
+	if v == "" {
+		return ""
+	}
+	return "/" + v
+}
+
 // pushRoutes normalises GOPROXY_PUSH_ROUTES: the usual boolean spellings map
 // to "true"/"false"; "clients" is kept; anything else is returned for
 // validate to reject.
@@ -402,6 +413,11 @@ func (c *NodeConfig) validate() error {
 		}
 		if c.WebPassword == "" {
 			return fmt.Errorf("GOPROXY_WEB_PASSWORD is required with GOPROXY_WEB_LISTEN")
+		}
+		for _, r := range c.WebPath {
+			if !(r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || strings.ContainsRune("/-._~", r)) {
+				return fmt.Errorf("GOPROXY_WEB_PATH %q: use letters, digits and - . _ ~ /", c.WebPath)
+			}
 		}
 	}
 	if c.InterfaceName == "" {

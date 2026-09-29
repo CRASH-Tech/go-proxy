@@ -35,7 +35,7 @@ async function api(method, path, body) {
   let data = {};
   try { data = await res.json(); } catch (_) { /* no body */ }
   if (!res.ok) {
-    if (res.status === 401 && path !== '/api/login') showLogin();
+    if (res.status === 401 && path !== 'api/login') showLogin();
     throw new HTTPError(res.status, data.error || res.statusText);
   }
   return data;
@@ -131,6 +131,7 @@ let lastConnections = null;
 let timer = null;
 
 function showLogin() {
+  document.title = 'Sign in';
   clearInterval(timer);
   timer = null;
   $('#app').hidden = true;
@@ -150,7 +151,7 @@ $('#login-form').addEventListener('submit', async (e) => {
   e.preventDefault();
   $('#login-error').textContent = '';
   try {
-    await api('POST', '/api/login', { password: $('#login-password').value });
+    await api('POST', 'api/login', { password: $('#login-password').value });
     $('#login-password').value = '';
     showApp();
   } catch (err) {
@@ -159,16 +160,16 @@ $('#login-form').addEventListener('submit', async (e) => {
 });
 
 $('#logout').addEventListener('click', async () => {
-  try { await api('POST', '/api/logout'); } catch (_) { /* ignore */ }
+  try { await api('POST', 'api/logout'); } catch (_) { /* ignore */ }
   showLogin();
 });
 
 async function refresh() {
   try {
-    state = await api('GET', '/api/state');
+    state = await api('GET', 'api/state');
     renderNode();
     renderPeers();
-    renderConnections(await api('GET', '/api/connections'));
+    renderConnections(await api('GET', 'api/connections'));
   } catch (err) {
     if (err.status !== 401) console.error(err);
   }
@@ -185,6 +186,7 @@ const pushRoutesText = {
 function renderNode() {
   const n = state.node;
   $('#node-name').textContent = n.name;
+  document.title = `${n.name} · goproxy`;
   const row = (k, ...v) => h('div', { class: 'kv-row' }, h('span', { class: 'k' }, k), h('span', { class: 'v' }, ...v));
   $('#node-facts').replaceChildren(
     h('div', { class: 'label' }, 'Public key'),
@@ -242,7 +244,7 @@ async function regenerateKey() {
     + 'public key; established sessions persist until they reconnect.');
   if (!ok) return;
   try {
-    await api('POST', '/api/node/key');
+    await api('POST', 'api/node/key');
     await refresh();
     renderKey();
   } catch (err) {
@@ -254,7 +256,7 @@ $('#key-form').addEventListener('submit', async (e) => {
   e.preventDefault();
   $('#key-error').textContent = '';
   try {
-    await api('POST', '/api/node/key', { private_key: $('#key-private').value.trim() });
+    await api('POST', 'api/node/key', { private_key: $('#key-private').value.trim() });
     $('#key-private').value = '';
     await refresh();
     renderKey();
@@ -324,7 +326,7 @@ async function toggleDisabled(name) {
   const raw = state.file_peers.find((p) => p.name === name);
   if (!raw) return;
   try {
-    await api('PUT', `/api/peers/${encodeURIComponent(name)}`, { ...raw, disabled: !raw.disabled });
+    await api('PUT', `api/peers/${encodeURIComponent(name)}`, { ...raw, disabled: !raw.disabled });
     refresh();
   } catch (err) {
     banner(err.message);
@@ -334,7 +336,7 @@ async function toggleDisabled(name) {
 async function deletePeer(name) {
   if (!(await confirmBox(`Delete peer ${name}? Its sessions are closed.`))) return;
   try {
-    await api('DELETE', `/api/peers/${encodeURIComponent(name)}`);
+    await api('DELETE', `api/peers/${encodeURIComponent(name)}`);
     refresh();
   } catch (err) {
     banner(err.message);
@@ -385,7 +387,7 @@ field('transport').addEventListener('change', syncTLSFields);
 
 $('#gen-keypair').addEventListener('click', async () => {
   try {
-    generatedKey = await api('POST', '/api/keypair');
+    generatedKey = await api('POST', 'api/keypair');
     field('public_key').value = generatedKey.public_key;
     $('#keypair-note').hidden = false;
   } catch (err) {
@@ -395,7 +397,7 @@ $('#gen-keypair').addEventListener('click', async () => {
 
 $('#next-ip').addEventListener('click', async () => {
   try {
-    field('ip').value = (await api('GET', '/api/next-ip')).ip;
+    field('ip').value = (await api('GET', 'api/next-ip')).ip;
   } catch (err) {
     $('#peer-error').textContent = err.message;
   }
@@ -420,8 +422,8 @@ $('#peer-form').addEventListener('submit', async (e) => {
   // A key typed over a generated one: the generated private key no longer applies.
   const privateKey = generatedKey && generatedKey.public_key === peer.public_key ? generatedKey.private_key : null;
   try {
-    if (editing) await api('PUT', `/api/peers/${encodeURIComponent(editing)}`, peer);
-    else await api('POST', '/api/peers', peer);
+    if (editing) await api('PUT', `api/peers/${encodeURIComponent(editing)}`, peer);
+    else await api('POST', 'api/peers', peer);
     $('#peer-dialog').close();
     await refresh();
     const saved = state.peers.find((p) => p.name === peer.name);
@@ -534,7 +536,7 @@ const settingFields = {
 
 async function loadSettings() {
   try {
-    settings = await api('GET', '/api/settings');
+    settings = await api('GET', 'api/settings');
   } catch (err) {
     return;
   }
@@ -576,7 +578,7 @@ $('#settings-save').addEventListener('click', async () => {
   if (!(await confirmBox('Save settings and restart the node? Tunnel traffic is interrupted; '
     + 'UDP peers may take up to 90 s to reconnect.'))) return;
   try {
-    await api('PUT', '/api/settings', body);
+    await api('PUT', 'api/settings', body);
   } catch (err) {
     $('#settings-error').textContent = err.message;
     return;
@@ -594,7 +596,7 @@ async function waitForRestart(wanted) {
   let back = false;
   for (let i = 0; i < 60 && !back; i++) {
     try {
-      await api('GET', '/api/settings');
+      await api('GET', 'api/settings');
       back = true;
     } catch (err) {
       if (err.status === 401) { $('#restarting').hidden = true; return; }
@@ -658,7 +660,7 @@ function confirmBox(text) {
 
 (async () => {
   try {
-    await api('GET', '/api/state');
+    await api('GET', 'api/state');
     showApp();
   } catch (err) {
     showLogin();
