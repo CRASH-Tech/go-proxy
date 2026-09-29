@@ -343,9 +343,105 @@ async function deletePeer(name) {
   }
 }
 
+// --- network lists ---
+
+const ipv4Net = /^(25[0-5]|2[0-4]\d|1?\d?\d)(\.(25[0-5]|2[0-4]\d|1?\d?\d)){3}\/(3[0-2]|[12]?\d)$/;
+const ipv4Addr = /^(25[0-5]|2[0-4]\d|1?\d?\d)(\.(25[0-5]|2[0-4]\d|1?\d?\d)){3}$/;
+
+// netChips turns a text input holding a list of networks into chips. The
+// input stays in the form (hidden) and holds the list space-separated, so it
+// is read as before; it gets an 'input' event on every change.
+function netChips(input) {
+  let list = [];
+  const entry = h('input', { class: 'chip-entry', autocomplete: 'off', spellcheck: 'false' });
+  const box = h('div', { class: 'chips', onclick: (e) => { if (e.target === box) entry.focus(); } }, entry);
+  input.before(box); // first in its label, so a click on the label focuses the entry
+  input.hidden = true;
+
+  const changed = () => {
+    input.value = list.join(' ');
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+  };
+  function render() {
+    box.querySelectorAll('.chip').forEach((c) => c.remove());
+    list.forEach((v, i) => {
+      const ok = ipv4Net.test(v);
+      entry.before(h('span', { class: ok ? 'chip' : 'chip bad', title: ok ? null : 'Not an IPv4 network' },
+        h('span', { ondblclick: () => edit(i) }, v),
+        // Not a <button>: inside a <label> a click on the label would press it.
+        h('span', {
+          class: 'chip-x', role: 'button', 'aria-label': `Remove ${v}`,
+          onmousedown: (e) => e.preventDefault(), // keep the entry focused: its blur re-renders
+          onclick: (e) => {
+            e.preventDefault();
+            if (entry.disabled) return;
+            list.splice(i, 1); render(); changed(); entry.focus();
+          },
+        }, '×')));
+    });
+    entry.placeholder = list.length ? '' : input.placeholder;
+  }
+  function add(text) {
+    let added = false;
+    for (let v of text.split(/[\s,;]+/).filter(Boolean)) {
+      if (ipv4Addr.test(v)) v += '/32';
+      if (!list.includes(v)) { list.push(v); added = true; }
+    }
+    if (added) { render(); changed(); }
+  }
+  function commit() {
+    const v = entry.value;
+    entry.value = '';
+    if (v.trim()) add(v);
+  }
+  function edit(i) {
+    if (entry.disabled) return;
+    commit();
+    entry.value = list[i];
+    list.splice(i, 1);
+    render();
+    changed();
+    entry.focus();
+  }
+
+  entry.addEventListener('keydown', (e) => {
+    if ((e.key === 'Enter' || e.key === 'Tab') && entry.value.trim()) {
+      if (e.key === 'Enter') e.preventDefault();
+      commit();
+    } else if (e.key === 'Backspace' && !entry.value && list.length) {
+      e.preventDefault();
+      edit(list.length - 1);
+    }
+  });
+  // A separator ends a network: typed, pasted, or from a mobile keyboard.
+  entry.addEventListener('input', () => {
+    if (!/[\s,;]/.test(entry.value)) return;
+    const parts = entry.value.split(/[\s,;]+/);
+    const rest = /[\s,;]$/.test(entry.value) ? '' : parts.pop();
+    add(parts.join(' '));
+    entry.value = rest;
+  });
+  entry.addEventListener('paste', (e) => {
+    const text = (e.clipboardData || window.clipboardData).getData('text');
+    if (!text.trim()) return;
+    e.preventDefault();
+    add(entry.value + ' ' + text);
+    entry.value = '';
+  });
+  entry.addEventListener('blur', commit);
+
+  return {
+    set(values) { list = [...values]; entry.value = ''; render(); input.value = list.join(' '); },
+    commit,
+    invalid: () => list.filter((v) => !ipv4Net.test(v)),
+    set disabled(d) { entry.disabled = d; box.classList.toggle('disabled', d); },
+  };
+}
+
 // --- peer form ---
 
 const field = (name) => $('#peer-form').elements.namedItem(name);
+const routeChips = netChips(field('routes'));
 let editing = null;      // name of the peer being edited; null for a new one
 let generatedKey = null; // key pair generated in the open form
 
@@ -363,6 +459,7 @@ function openPeer(name) {
   $('#peer-title').textContent = raw ? `Peer ${raw.name}` : 'New peer';
   $('#keypair-note').hidden = true;
   $('#peer-error').textContent = '';
+  routeChips.set(raw ? raw.routes || [] : []);
   if (raw) {
     field('name').value = raw.name;
     field('endpoint').value = raw.endpoint || '';
@@ -371,7 +468,6 @@ function openPeer(name) {
     field('sni').value = (raw.tls && raw.tls.sni) || '';
     field('insecure').checked = !!(raw.tls && raw.tls.insecure);
     field('public_key').value = raw.public_key || '';
-    field('routes').value = (raw.routes || []).join(' ');
     field('ip').value = raw.ip || '';
     field('nat').checked = !!raw.nat;
     field('enabled').checked = !raw.disabled;
@@ -406,6 +502,12 @@ $('#next-ip').addEventListener('click', async () => {
 $('#peer-form').addEventListener('submit', async (e) => {
   e.preventDefault();
   $('#peer-error').textContent = '';
+  routeChips.commit();
+  const bad = routeChips.invalid();
+  if (bad.length) {
+    $('#peer-error').textContent = `Not an IPv4 network: ${bad.join(', ')}`;
+    return;
+  }
   const peer = {
     name: field('name').value.trim(),
     public_key: field('public_key').value.trim(),
@@ -436,6 +538,7 @@ $('#peer-form').addEventListener('submit', async (e) => {
 // --- config for the peer's side ---
 
 let configFor = null; // {peer, privateKey}
+const cfgChips = netChips($('#cfg-routes'));
 
 function openConfig(peer, privateKey) {
   configFor = { peer, privateKey: privateKey || null };
@@ -449,7 +552,7 @@ function openConfig(peer, privateKey) {
     if (q.name === peer.name || q.disabled) continue;
     for (const r of q.routes || []) if (r !== '0.0.0.0/0') nets.add(r);
   }
-  $('#cfg-routes').value = [...nets].join(' ');
+  cfgChips.set([...nets]);
   $('#cfg-all').checked = false;
   $('#cfg-secret').hidden = !privateKey;
   renderConfig();
@@ -462,8 +565,8 @@ function renderConfig() {
   const n = state.node;
   const us = ($('#cfg-name').value.trim() || n.name).toUpperCase().replace(/[^A-Z0-9_-]/g, '_');
   const all = $('#cfg-all').checked;
-  $('#cfg-routes').disabled = all;
-  const routes = all ? ['0.0.0.0/0'] : splitList($('#cfg-routes').value);
+  cfgChips.disabled = all;
+  const routes = all ? ['0.0.0.0/0'] : splitList($('#cfg-routes').value).filter((r) => ipv4Net.test(r));
   const endpoint = $('#cfg-endpoint').value.trim();
   const psk = peer.psk || n.psk;
 
@@ -530,7 +633,7 @@ const settingFields = {
     help: 'Install peer routes into the TUN.',
   },
   GOPROXY_MASQUERADE: { label: 'SNAT interface', placeholder: 'eth0' },
-  GOPROXY_MASQUERADE_IPS: { label: 'SNAT source networks', placeholder: 'TUN network' },
+  GOPROXY_MASQUERADE_IPS: { label: 'SNAT source networks', placeholder: 'TUN network', networks: true },
   GOPROXY_LOG_CONNECTIONS: { label: 'Log connections', options: [['false', 'off'], ['true', 'on']] },
 };
 
@@ -560,6 +663,12 @@ async function loadSettings() {
       h('span', {}, f.label, s.source === 'env' ? h('span', { class: 'src env' }, 'set by environment') : null),
       input,
       f.help ? h('small', {}, f.help) : null));
+    if (f.networks) {
+      const chips = netChips(input);
+      chips.set(splitList(s.value));
+      input.value = s.value; // unchanged until edited
+      chips.disabled = locked;
+    }
   }
 }
 
