@@ -19,13 +19,13 @@ import (
 // and this node's TUN address.
 func (n *Node) authorizer(matched **peer) noise.Authorizer {
 	return func(pub keys.PublicKey) (psk [32]byte, response []byte, ok bool) {
-		p := n.byKey[pub]
+		p := n.set.Load().byKey[pub]
 		if p == nil {
 			return psk, nil, false
 		}
 		*matched = p
 		tunIP := net.IP(n.tunIP[:]).String()
-		hello := protocol.NewServerHello(p.cfg.IP, tunIP, n.tunNet, n.cfg.MTU)
+		hello := protocol.NewServerHello(p.conf().IP, tunIP, n.tunNet, n.cfg.MTU)
 		return p.psk, hello.Marshal(), true
 	}
 }
@@ -81,7 +81,7 @@ func (n *Node) handleConn(conn net.Conn) {
 	// can replay them to the fallback (e.g. a reverse-proxy backend).
 	var p *peer
 	rec := &recorderConn{Conn: conn, recording: true}
-	sess, _, payload1, err := noise.Respond(rec, n.priv, n.authorizer(&p))
+	sess, _, payload1, err := noise.Respond(rec, n.privKey(), n.authorizer(&p))
 	rec.recording = false
 	if err != nil {
 		if n.fb != nil {
@@ -101,8 +101,11 @@ func (n *Node) handleConn(conn net.Conn) {
 	}
 
 	l := n.newLink(p, false, sess, n.cfg.MTU)
+	l.remote = remote.String()
 	l.closeFn = func() { sess.Close() }
-	p.attach(l)
+	if !p.adopt(l) {
+		return
+	}
 	n.startLink(l)
 	log.Printf("[%s] connected from %s", p.name, remote)
 

@@ -99,7 +99,7 @@ func (u *udpListener) handshake(addr *net.UDPAddr, msg1 []byte) {
 		_, err := u.pc.WriteToUDP(b, addr)
 		return err
 	}
-	ps, _, payload1, err := noise.RespondPacket(msg1, n.priv, n.authorizer(&p), write)
+	ps, _, payload1, err := noise.RespondPacket(msg1, n.privKey(), n.authorizer(&p), write)
 	if err != nil {
 		return // probe/scanner or unauthorized; drop silently
 	}
@@ -109,6 +109,7 @@ func (u *udpListener) handshake(addr *net.UDPAddr, msg1 []byte) {
 
 	key := addr.String()
 	l := n.newLink(p, false, ps, n.cfg.MTU)
+	l.remote = key
 	l.lastSeen.Store(time.Now().UnixNano())
 	l.closeFn = func() {
 		u.mu.Lock()
@@ -125,7 +126,9 @@ func (u *udpListener) handshake(addr *net.UDPAddr, msg1 []byte) {
 	if old.l != nil {
 		old.l.close()
 	}
-	p.attach(l) // replaces the peer's session from another address, if any
+	if !p.adopt(l) { // replaces the peer's session from another address, if any
+		return
+	}
 	n.startLink(l)
 	log.Printf("[%s] connected from %s (udp)", p.name, addr)
 }

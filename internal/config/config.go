@@ -5,13 +5,17 @@ package config
 
 import (
 	"encoding/base64"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"net/netip"
 	"os"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 
 	"golang.org/x/crypto/blake2s"
 
@@ -27,25 +31,28 @@ type TLSServerConfig struct {
 
 // TLSClientConfig configures the TLS transport when connecting to a peer.
 type TLSClientConfig struct {
-	SNI      string
-	Insecure bool
+	SNI      string `json:"sni,omitempty"`
+	Insecure bool   `json:"insecure,omitempty"`
 }
 
 // Peer is another node (or a road-warrior client) this node exchanges traffic
 // with. The same description serves both directions: the peer may connect to
-// us, and if Endpoint is set we connect to it as well.
+// us, and if Endpoint is set we connect to it as well. Peers come from the
+// environment (GOPROXY_PEER_<NAME>_*) or, when managed in the web UI, from
+// the data directory's peers.json.
 type Peer struct {
-	Name      string // from the GOPROXY_PEER_<NAME> suffix
-	PublicKey string
-	Routes    []string // IPv4 CIDRs behind the peer (destinations and allowed sources)
-	IP        string   // tunnel IP handed to the peer when it connects; empty = none
-	Endpoint  string   // host:port to connect to; empty = only accept the peer
-	NAT       bool     // translate clients' traffic to the peer to the node's address
+	Name      string   `json:"name"`
+	PublicKey string   `json:"public_key"`
+	Routes    []string `json:"routes,omitempty"`   // IPv4 CIDRs behind the peer (destinations and allowed sources)
+	IP        string   `json:"ip,omitempty"`       // tunnel IP handed to the peer when it connects; empty = none
+	Endpoint  string   `json:"endpoint,omitempty"` // host:port to connect to; empty = only accept the peer
+	NAT       bool     `json:"nat,omitempty"`      // translate clients' traffic to the peer to the node's address
+	Disabled  bool     `json:"disabled,omitempty"` // kept in the configuration, but not used
 
-	Transport    string // transport used to connect to Endpoint
-	PSK          string
-	TLS          TLSClientConfig
-	KeepaliveSec int
+	Transport    string          `json:"transport,omitempty"` // transport used to connect to Endpoint
+	PSK          string          `json:"psk,omitempty"`
+	TLS          TLSClientConfig `json:"tls,omitempty"`
+	KeepaliveSec int             `json:"keepalive,omitempty"`
 }
 
 // ParsePublicKey returns the peer's static public key.
@@ -79,7 +86,13 @@ func (p *Peer) Prefixes() ([]netip.Prefix, error) {
 // NodeConfig is the whole configuration of a node: its identity, its TUN, an
 // optional listener and its peers.
 type NodeConfig struct {
-	PrivateKey string
+	PrivateKey string // empty: kept in DataDir (generated on first start)
+	Name       string // this node's name, used in configs generated for peers
+	DataDir    string // where web-managed peers and a generated key are kept; empty = none
+
+	WebListen   string // address of the web UI; empty = off
+	WebPassword string
+	WebTLS      bool // serve the web UI over HTTPS with a self-signed certificate
 
 	InterfaceName string   // TUN device name
 	Address       string   // TUN address (IPv4 CIDR)
@@ -103,7 +116,34 @@ type NodeConfig struct {
 	ObfsMaxPad int  // max random padding per record (traffic-analysis resistance)
 	ObfsCover  bool // send randomised cover traffic
 
-	Peers []Peer
+	// Defaults for peer fields a peer leaves empty.
+	DefaultPSK       string
+	DefaultSNI       string
+	DefaultInsecure  bool
+	DefaultKeepalive int
+
+	Peers []Peer // from the environment
+
+	// Sources tells, for each of EditableSettings, where its value came from:
+	// "env" (read-only in the web UI), "settings" (settings.json) or "default".
+	Sources map[string]string
+}
+
+// ApplyDefaults fills a peer's empty fields from the node's defaults (TLS
+// Insecure is a plain flag and is left as it is).
+func (c *NodeConfig) ApplyDefaults(p *Peer) {
+	if p.Transport == "" {
+		p.Transport = c.Transport
+	}
+	if p.PSK == "" {
+		p.PSK = c.DefaultPSK
+	}
+	if p.TLS.SNI == "" {
+		p.TLS.SNI = c.DefaultSNI
+	}
+	if p.KeepaliveSec == 0 {
+		p.KeepaliveSec = c.DefaultKeepalive
+	}
 }
 
 // ParsePrivateKey returns the node's static private key.
@@ -111,17 +151,48 @@ func (c *NodeConfig) ParsePrivateKey() (keys.PrivateKey, error) {
 	return keys.ParsePrivateKey(c.PrivateKey)
 }
 
+// EditableSettings are the node settings the web UI may set. A value from
+// the environment takes precedence and is read-only there; otherwise the
+// data directory's settings.json supplies it.
+var EditableSettings = []string{
+	"GOPROXY_NAME",
+	"GOPROXY_LISTEN",
+	"GOPROXY_TRANSPORT",
+	"GOPROXY_PSK",
+	"GOPROXY_TLS_HOST",
+	"GOPROXY_TUN_ADDRESS",
+	"GOPROXY_PUSH_ROUTES",
+	"GOPROXY_MASQUERADE",
+	"GOPROXY_MASQUERADE_IPS",
+	"GOPROXY_LOG_CONNECTIONS",
+}
+
 // --- env helpers ---
 
-func env(key, def string) string {
+var (
+	loadMu  sync.Mutex        // serialises loads, which share overlay
+	overlay map[string]string // settings.json during a load
+)
+
+// lookup returns a setting from the environment or, failing that, from the
+// settings being loaded.
+func lookup(key string) (string, bool) {
 	if v, ok := os.LookupEnv(key); ok {
+		return v, true
+	}
+	v, ok := overlay[key]
+	return v, ok
+}
+
+func env(key, def string) string {
+	if v, ok := lookup(key); ok {
 		return v
 	}
 	return def
 }
 
 func envBool(key string, def bool) bool {
-	v, ok := os.LookupEnv(key)
+	v, ok := lookup(key)
 	if !ok || strings.TrimSpace(v) == "" {
 		return def
 	}
@@ -136,7 +207,7 @@ func envBool(key string, def bool) bool {
 }
 
 func envInt(key string, def int) int {
-	v, ok := os.LookupEnv(key)
+	v, ok := lookup(key)
 	if !ok || strings.TrimSpace(v) == "" {
 		return def
 	}
@@ -161,31 +232,60 @@ func splitList(s string) []string {
 	return out
 }
 
-// peerNames scans the environment for GOPROXY_PEER_<NAME> base variables (the
-// public key). A key is a base var iff the part after the prefix contains no
-// underscore, so that field vars like GOPROXY_PEER_DC2_ROUTES are not mistaken
-// for a peer named "DC2_ROUTES". Names are returned sorted for determinism.
+// peerNames scans the environment for GOPROXY_PEER_<NAME>_PUBLIC_KEY, which
+// declares a peer. Names are returned sorted for determinism.
 func peerNames() []string {
 	var names []string
-	const prefix = "GOPROXY_PEER_"
 	for _, kv := range os.Environ() {
 		k, _, _ := strings.Cut(kv, "=")
-		rest, ok := strings.CutPrefix(k, prefix)
-		if !ok || rest == "" || strings.Contains(rest, "_") {
+		rest, ok := strings.CutPrefix(k, "GOPROXY_PEER_")
+		if !ok {
 			continue
 		}
-		names = append(names, rest)
+		if name, ok := strings.CutSuffix(rest, "_PUBLIC_KEY"); ok && name != "" {
+			names = append(names, name)
+		}
 	}
 	sort.Strings(names)
 	return names
 }
 
-// LoadNode builds the node config from the environment. Each peer is declared
-// by GOPROXY_PEER_<NAME> (its public key) plus optional GOPROXY_PEER_<NAME>_<FIELD>
-// variables; unset fields fall back to the global GOPROXY_* defaults.
+// LoadNode builds the node config from the environment and, for the settings
+// the environment leaves unset, the data directory's settings.json. Each peer
+// is declared by GOPROXY_PEER_<NAME>_PUBLIC_KEY plus optional
+// GOPROXY_PEER_<NAME>_<FIELD> variables; unset fields fall back to the global
+// GOPROXY_* defaults.
 func LoadNode() (*NodeConfig, error) {
+	var settings map[string]string
+	if dir := strings.TrimSpace(os.Getenv("GOPROXY_DATA_DIR")); dir != "" {
+		var err error
+		if settings, err = ReadSettings(dir); err != nil {
+			return nil, err
+		}
+	}
+	return LoadNodeWith(settings)
+}
+
+// LoadNodeWith is LoadNode with the given settings in place of settings.json,
+// e.g. to check settings before saving them.
+func LoadNodeWith(settings map[string]string) (*NodeConfig, error) {
+	loadMu.Lock()
+	defer loadMu.Unlock()
+	overlay = map[string]string{}
+	for _, k := range EditableSettings {
+		if v, ok := settings[k]; ok {
+			overlay[k] = v
+		}
+	}
+	defer func() { overlay = nil }()
+
 	c := &NodeConfig{
-		PrivateKey:    env("GOPROXY_PRIVATE_KEY", ""),
+		PrivateKey:    strings.TrimSpace(env("GOPROXY_PRIVATE_KEY", "")),
+		Name:          strings.TrimSpace(env("GOPROXY_NAME", "")),
+		DataDir:       strings.TrimSpace(env("GOPROXY_DATA_DIR", "")),
+		WebListen:     strings.TrimSpace(env("GOPROXY_WEB_LISTEN", "")),
+		WebPassword:   env("GOPROXY_WEB_PASSWORD", ""),
+		WebTLS:        envBool("GOPROXY_WEB_TLS", false),
 		InterfaceName: env("GOPROXY_IFNAME", "goproxy0"),
 		Address:       env("GOPROXY_TUN_ADDRESS", "10.255.255.1/32"),
 		MTU:           envInt("GOPROXY_MTU", 1320),
@@ -213,30 +313,66 @@ func LoadNode() (*NodeConfig, error) {
 	}
 	c.FwMark = int(mark)
 
-	gPSK := env("GOPROXY_PSK", "")
-	gSNI := env("GOPROXY_TLS_SNI", "")
-	gInsecure := envBool("GOPROXY_TLS_INSECURE", false)
-	gKeepalive := envInt("GOPROXY_KEEPALIVE", 25)
+	c.DefaultPSK = env("GOPROXY_PSK", "")
+	c.DefaultSNI = env("GOPROXY_TLS_SNI", "")
+	c.DefaultInsecure = envBool("GOPROXY_TLS_INSECURE", false)
+	c.DefaultKeepalive = envInt("GOPROXY_KEEPALIVE", 25)
+	if c.Name == "" {
+		c.Name = defaultName()
+	}
+	c.Sources = map[string]string{}
+	for _, k := range EditableSettings {
+		switch _, inEnv := os.LookupEnv(k); {
+		case inEnv:
+			c.Sources[k] = "env"
+		case overlay[k] != "":
+			c.Sources[k] = "settings"
+		default:
+			c.Sources[k] = "default"
+		}
+	}
 
 	for _, name := range peerNames() {
 		base := "GOPROXY_PEER_" + name
-		c.Peers = append(c.Peers, Peer{
+		p := Peer{
 			Name:      name,
-			PublicKey: strings.TrimSpace(env(base, "")),
+			PublicKey: strings.TrimSpace(env(base+"_PUBLIC_KEY", "")),
 			Routes:    splitList(env(base+"_ROUTES", "")),
 			IP:        strings.TrimSpace(env(base+"_IP", "")),
 			Endpoint:  strings.TrimSpace(env(base+"_ENDPOINT", "")),
 			NAT:       envBool(base+"_NAT", false),
-			Transport: env(base+"_TRANSPORT", c.Transport),
-			PSK:       env(base+"_PSK", gPSK),
+			Disabled:  envBool(base+"_DISABLED", false),
+			Transport: env(base+"_TRANSPORT", ""),
+			PSK:       env(base+"_PSK", ""),
 			TLS: TLSClientConfig{
-				SNI:      env(base+"_SNI", gSNI),
-				Insecure: envBool(base+"_INSECURE", gInsecure),
+				SNI:      env(base+"_SNI", ""),
+				Insecure: envBool(base+"_INSECURE", c.DefaultInsecure),
 			},
-			KeepaliveSec: envInt(base+"_KEEPALIVE", gKeepalive),
-		})
+			KeepaliveSec: envInt(base+"_KEEPALIVE", 0),
+		}
+		c.ApplyDefaults(&p)
+		c.Peers = append(c.Peers, p)
 	}
 	return c, c.validate()
+}
+
+// defaultName derives a node name from the hostname: upper case, letters,
+// digits, '-' and '_' only.
+func defaultName() string {
+	h, _ := os.Hostname()
+	name := strings.Map(func(r rune) rune {
+		switch {
+		case r >= 'a' && r <= 'z':
+			return r - 'a' + 'A'
+		case r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '-', r == '_':
+			return r
+		}
+		return -1
+	}, strings.Split(h, ".")[0])
+	if name == "" {
+		return "NODE"
+	}
+	return name
 }
 
 // pushRoutes normalises GOPROXY_PUSH_ROUTES: the usual boolean spellings map
@@ -255,8 +391,18 @@ func pushRoutes(v string) string {
 func validTransport(t string) bool { return t == "aead" || t == "tls" || t == "udp" }
 
 func (c *NodeConfig) validate() error {
-	if _, err := c.ParsePrivateKey(); err != nil {
-		return fmt.Errorf("GOPROXY_PRIVATE_KEY: %w", err)
+	if c.PrivateKey != "" || c.DataDir == "" {
+		if _, err := c.ParsePrivateKey(); err != nil {
+			return fmt.Errorf("GOPROXY_PRIVATE_KEY: %w (or set GOPROXY_DATA_DIR to keep a generated one)", err)
+		}
+	}
+	if c.WebListen != "" {
+		if _, _, err := net.SplitHostPort(c.WebListen); err != nil {
+			return fmt.Errorf("GOPROXY_WEB_LISTEN %q: %w", c.WebListen, err)
+		}
+		if c.WebPassword == "" {
+			return fmt.Errorf("GOPROXY_WEB_PASSWORD is required with GOPROXY_WEB_LISTEN")
+		}
 	}
 	if c.InterfaceName == "" {
 		return fmt.Errorf("GOPROXY_IFNAME is empty")
@@ -284,18 +430,58 @@ func (c *NodeConfig) validate() error {
 	if err := c.validateFallback(); err != nil {
 		return err
 	}
-	if len(c.Peers) == 0 {
-		return fmt.Errorf("no peers configured (set GOPROXY_PEER_<NAME>=public_key)")
+	if err := ValidatePeers(c.Peers); err != nil {
+		return err
 	}
+	// Without the web UI the environment must give the node something to do.
+	if c.WebListen == "" {
+		if len(c.Peers) == 0 && c.DataDir == "" {
+			return fmt.Errorf("no peers configured (set GOPROXY_PEER_<NAME>_PUBLIC_KEY)")
+		}
+		dialing := false
+		for _, p := range c.Peers {
+			dialing = dialing || p.Endpoint != ""
+		}
+		if c.Listen == "" && !dialing && c.DataDir == "" {
+			return fmt.Errorf("nothing to do: set GOPROXY_LISTEN and/or a peer's _ENDPOINT")
+		}
+	}
+	return nil
+}
 
-	dialing := false
+// ValidPeerName reports whether name can name a peer: letters, digits, '-'
+// and '_', at most 32 characters.
+func ValidPeerName(name string) bool {
+	if name == "" || len(name) > 32 {
+		return false
+	}
+	for _, r := range name {
+		if !(r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '-' || r == '_') {
+			return false
+		}
+	}
+	return true
+}
+
+// ValidatePeers checks a set of peers on its own and against each other:
+// names and keys are unique, and a prefix belongs to one enabled peer only
+// (a disabled peer may share its routes, e.g. as a standby).
+func ValidatePeers(peers []Peer) error {
 	owner := map[netip.Prefix]string{}
 	keyOwner := map[keys.PublicKey]string{}
-	for i := range c.Peers {
-		p := &c.Peers[i]
+	names := map[string]bool{}
+	for i := range peers {
+		p := &peers[i]
+		if !ValidPeerName(p.Name) {
+			return fmt.Errorf("peer name %q: use letters, digits, '-' and '_' (up to 32)", p.Name)
+		}
+		if names[p.Name] {
+			return fmt.Errorf("peer %q is defined twice", p.Name)
+		}
+		names[p.Name] = true
 		pub, err := p.ParsePublicKey()
 		if err != nil {
-			return fmt.Errorf("GOPROXY_PEER_%s: public key: %w", p.Name, err)
+			return fmt.Errorf("peer %q: public key: %w", p.Name, err)
 		}
 		if other, ok := keyOwner[pub]; ok {
 			return fmt.Errorf("peers %q and %q have the same public key", other, p.Name)
@@ -307,9 +493,12 @@ func (c *NodeConfig) validate() error {
 			return fmt.Errorf("peer %q: %w", p.Name, err)
 		}
 		if len(prefixes) == 0 {
-			return fmt.Errorf("peer %q: set GOPROXY_PEER_%s_ROUTES and/or _IP", p.Name, p.Name)
+			return fmt.Errorf("peer %q: needs routes and/or an IP", p.Name)
 		}
 		for _, pfx := range prefixes {
+			if p.Disabled {
+				break
+			}
 			if other, ok := owner[pfx]; ok {
 				return fmt.Errorf("route %s is set on both peer %q and %q", pfx, other, p.Name)
 			}
@@ -317,7 +506,6 @@ func (c *NodeConfig) validate() error {
 		}
 
 		if p.Endpoint != "" {
-			dialing = true
 			if _, _, err := net.SplitHostPort(p.Endpoint); err != nil {
 				return fmt.Errorf("peer %q endpoint %q: %w", p.Name, p.Endpoint, err)
 			}
@@ -325,9 +513,6 @@ func (c *NodeConfig) validate() error {
 				return fmt.Errorf("peer %q: transport must be aead, tls or udp", p.Name)
 			}
 		}
-	}
-	if c.Listen == "" && !dialing {
-		return fmt.Errorf("nothing to do: set GOPROXY_LISTEN and/or a peer's _ENDPOINT")
 	}
 	return nil
 }
@@ -366,4 +551,131 @@ func DerivePSK(s string) [32]byte {
 	}
 	out = blake2s.Sum256([]byte("goproxy-psk:" + s))
 	return out
+}
+
+// settingsFile holds, in the data directory, the settings made in the web UI.
+const settingsFile = "settings.json"
+
+// ReadSettings returns the settings saved in dir (none if there is no file).
+func ReadSettings(dir string) (map[string]string, error) {
+	b, err := os.ReadFile(filepath.Join(dir, settingsFile))
+	if errors.Is(err, os.ErrNotExist) {
+		return map[string]string{}, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	m := map[string]string{}
+	if err := json.Unmarshal(b, &m); err != nil {
+		return nil, fmt.Errorf("%s: %w", filepath.Join(dir, settingsFile), err)
+	}
+	return m, nil
+}
+
+// WriteSettings saves settings in dir (mode 0600: the PSK is among them).
+// Only EditableSettings with a non-empty value are kept.
+func WriteSettings(dir string, settings map[string]string) error {
+	m := map[string]string{}
+	for _, k := range EditableSettings {
+		if v := strings.TrimSpace(settings[k]); v != "" {
+			m[k] = v
+		}
+	}
+	b, err := json.MarshalIndent(m, "", "  ")
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return err
+	}
+	tmp, err := os.CreateTemp(dir, "."+settingsFile+".*")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(tmp.Name())
+	if err := tmp.Chmod(0o600); err != nil {
+		tmp.Close()
+		return err
+	}
+	if _, err := tmp.Write(append(b, '\n')); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmp.Name(), filepath.Join(dir, settingsFile))
+}
+
+// SettingValues returns the value in effect of each of EditableSettings, as
+// it would be written in the environment.
+func (c *NodeConfig) SettingValues() map[string]string {
+	return map[string]string{
+		"GOPROXY_NAME":            c.Name,
+		"GOPROXY_LISTEN":          c.Listen,
+		"GOPROXY_TRANSPORT":       c.Transport,
+		"GOPROXY_PSK":             c.DefaultPSK,
+		"GOPROXY_TLS_HOST":        c.TLS.Host,
+		"GOPROXY_TUN_ADDRESS":     c.Address,
+		"GOPROXY_PUSH_ROUTES":     c.PushRoutes,
+		"GOPROXY_MASQUERADE":      c.Masquerade,
+		"GOPROXY_MASQUERADE_IPS":  strings.Join(c.MasqueradeIPs, " "),
+		"GOPROXY_LOG_CONNECTIONS": strconv.FormatBool(c.LogConns),
+	}
+}
+
+// Files that let a settings change made in the web UI be undone if the node
+// then fails to start with it.
+const (
+	settingsPrev    = "settings.prev.json"
+	settingsPending = "settings.pending"
+)
+
+// BeginSettingsChange saves settings, keeping the current ones to fall back
+// to, and marks the change as pending until ConfirmSettings.
+func BeginSettingsChange(dir string, settings map[string]string) error {
+	cur, err := ReadSettings(dir)
+	if err != nil {
+		return err
+	}
+	b, _ := json.Marshal(cur)
+	if err := os.WriteFile(filepath.Join(dir, settingsPrev), b, 0o600); err != nil {
+		return err
+	}
+	if err := WriteSettings(dir, settings); err != nil {
+		return err
+	}
+	return os.WriteFile(filepath.Join(dir, settingsPending), nil, 0o600)
+}
+
+// SettingsPending reports whether a settings change awaits confirmation.
+func SettingsPending(dir string) bool {
+	if dir == "" {
+		return false
+	}
+	_, err := os.Stat(filepath.Join(dir, settingsPending))
+	return err == nil
+}
+
+// ConfirmSettings accepts a pending change: the node started with it.
+func ConfirmSettings(dir string) {
+	os.Remove(filepath.Join(dir, settingsPending))
+	os.Remove(filepath.Join(dir, settingsPrev))
+}
+
+// RollbackSettings undoes a pending change, restoring the previous settings.
+func RollbackSettings(dir string) error {
+	b, err := os.ReadFile(filepath.Join(dir, settingsPrev))
+	if err != nil {
+		return err
+	}
+	prev := map[string]string{}
+	if err := json.Unmarshal(b, &prev); err != nil {
+		return err
+	}
+	if err := WriteSettings(dir, prev); err != nil {
+		return err
+	}
+	ConfirmSettings(dir)
+	return nil
 }

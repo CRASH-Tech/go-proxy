@@ -36,8 +36,14 @@ type Device struct {
 
 // Open creates (or attaches to) a TUN device. If name is empty the kernel
 // assigns one (e.g. tun0). The chosen name is available via Name().
+//
+// The descriptor is attached to the interface (TUNSETIFF) before Go sees it:
+// polling an unattached TUN reports an error, and if the runtime's poller
+// registered the file at that point it could mark it broken for good, making
+// every Read fail with "not pollable". Handed over afterwards, non-blocking,
+// it is served by the poller -- and Close interrupts a pending Read.
 func Open(name string) (*Device, error) {
-	f, err := os.OpenFile("/dev/net/tun", os.O_RDWR, 0)
+	fd, err := syscall.Open("/dev/net/tun", syscall.O_RDWR|syscall.O_CLOEXEC, 0)
 	if err != nil {
 		return nil, fmt.Errorf("open /dev/net/tun: %w (need root and the tun module)", err)
 	}
@@ -46,10 +52,14 @@ func Open(name string) (*Device, error) {
 	copy(req.name[:], name)
 	req.flags = cIFFTUN | cIFFNOPI
 
-	_, _, errno := syscall.Syscall(syscall.SYS_IOCTL, f.Fd(), uintptr(cTUNSETIF), uintptr(unsafe.Pointer(&req)))
+	_, _, errno := syscall.Syscall(syscall.SYS_IOCTL, uintptr(fd), uintptr(cTUNSETIF), uintptr(unsafe.Pointer(&req)))
 	if errno != 0 {
-		f.Close()
+		syscall.Close(fd)
 		return nil, fmt.Errorf("TUNSETIFF: %w", errno)
+	}
+	if err := syscall.SetNonblock(fd, true); err != nil {
+		syscall.Close(fd)
+		return nil, fmt.Errorf("tun: set non-blocking: %w", err)
 	}
 
 	realName := string(req.name[:])
@@ -57,7 +67,7 @@ func Open(name string) (*Device, error) {
 		realName = realName[:i]
 	}
 
-	return &Device{f: f, name: realName}, nil
+	return &Device{f: os.NewFile(uintptr(fd), "/dev/net/tun"), name: realName}, nil
 }
 
 // Name returns the interface name (e.g. "tun0").

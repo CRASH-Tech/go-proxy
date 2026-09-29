@@ -94,13 +94,13 @@ A node is configured with its identity and TUN, an optional listener, and its
 peers:
 
 ```bash
-GOPROXY_PRIVATE_KEY=...              # this node's private key
+GOPROXY_PRIVATE_KEY=...              # this node's private key (or kept in GOPROXY_DATA_DIR)
 GOPROXY_TUN_ADDRESS=10.8.0.1/24      # TUN address (default 10.255.255.1/32)
 GOPROXY_LISTEN=0.0.0.0:443           # accept peers (optional)
 GOPROXY_TRANSPORT=tls                # listener transport, default for connecting
 GOPROXY_PSK=a-long-shared-secret     # default PSK for all peers
 
-GOPROXY_PEER_<NAME>=<public key>     # declares a peer
+GOPROXY_PEER_<NAME>_PUBLIC_KEY=<public key>     # declares a peer
 ```
 
 Per-peer settings (`GOPROXY_PEER_<NAME>_<FIELD>`):
@@ -154,7 +154,9 @@ let its road warriors reach another site that has no route to them.
 - The node's own traffic is never translated. Other protocols and non-first
   IP fragments pass unchanged.
 
-Other node settings: `GOPROXY_IFNAME` (TUN name, `goproxy0`), `GOPROXY_MTU`
+Peers can also be managed in the [web UI](#web-ui). Other node settings:
+`GOPROXY_NAME` (this node's name in configs generated for peers; the
+hostname by default), `GOPROXY_IFNAME` (TUN name, `goproxy0`), `GOPROXY_MTU`
 (1320), `GOPROXY_FWMARK` (`0x676f`, the `SO_MARK` put on the node's own
 connections to peers and their DNS lookups, so host policy routing can keep them
 out of the TUN), `GOPROXY_PUSH_ROUTES` (below), `GOPROXY_MASQUERADE` (an
@@ -224,9 +226,9 @@ export GOPROXY_TLS_HOST=www.microsoft.com          # for the self-signed cert
 export GOPROXY_PSK="a-long-shared-secret"
 export GOPROXY_TUN_ADDRESS=10.8.0.1/24             # the clients' network
 
-export GOPROXY_PEER_LAPTOP="PUB_OF_LAPTOP"
+export GOPROXY_PEER_LAPTOP_PUBLIC_KEY="PUB_OF_LAPTOP"
 export GOPROXY_PEER_LAPTOP_IP=10.8.0.2
-export GOPROXY_PEER_OFFICE="PUB_OF_OFFICE"
+export GOPROXY_PEER_OFFICE_PUBLIC_KEY="PUB_OF_OFFICE"
 export GOPROXY_PEER_OFFICE_IP=10.8.0.3
 export GOPROXY_PEER_OFFICE_ROUTES=192.168.50.0/24  # a LAN behind that client (optional)
 
@@ -269,7 +271,7 @@ export GOPROXY_PRIVATE_KEY="$(cat laptop.key)"
 export GOPROXY_PSK="a-long-shared-secret"
 export GOPROXY_TLS_INSECURE=true                   # accept the self-signed cert
 
-export GOPROXY_PEER_EXIT="PUB_OF_EXIT"
+export GOPROXY_PEER_EXIT_PUBLIC_KEY="PUB_OF_EXIT"
 export GOPROXY_PEER_EXIT_ENDPOINT=EXIT_PUBLIC_IP:443
 export GOPROXY_PEER_EXIT_TRANSPORT=tls
 export GOPROXY_PEER_EXIT_ROUTES=0.0.0.0/0
@@ -281,8 +283,8 @@ Several exits split by destination are just several peers — the more specific
 route wins, and different exits may use different transports:
 
 ```bash
-GOPROXY_PEER_DE=... GOPROXY_PEER_DE_ENDPOINT=de.example:443 GOPROXY_PEER_DE_ROUTES=0.0.0.0/0
-GOPROXY_PEER_JP=... GOPROXY_PEER_JP_ENDPOINT=jp.example:443 GOPROXY_PEER_JP_TRANSPORT=udp \
+GOPROXY_PEER_DE_PUBLIC_KEY=... GOPROXY_PEER_DE_ENDPOINT=de.example:443 GOPROXY_PEER_DE_ROUTES=0.0.0.0/0
+GOPROXY_PEER_JP_PUBLIC_KEY=... GOPROXY_PEER_JP_ENDPOINT=jp.example:443 GOPROXY_PEER_JP_TRANSPORT=udp \
 GOPROXY_PEER_JP_ROUTES="203.0.113.0/24 198.51.100.7/32"
 ```
 
@@ -414,31 +416,31 @@ GOPROXY_TLS_INSECURE=true
 GOPROXY_PSK=a-long-shared-secret
 GOPROXY_TUN_ADDRESS=10.1.254.1/24
 
-GOPROXY_PEER_DC2=<DC2 public>
+GOPROXY_PEER_DC2_PUBLIC_KEY=<DC2 public>
 GOPROXY_PEER_DC2_ENDPOINT=dc2.example:443
 GOPROXY_PEER_DC2_ROUTES=10.2.0.0/16
-GOPROXY_PEER_DC3=<DC3 public>
+GOPROXY_PEER_DC3_PUBLIC_KEY=<DC3 public>
 GOPROXY_PEER_DC3_ENDPOINT=dc3.example:443
 GOPROXY_PEER_DC3_ROUTES=10.3.0.0/16
 
-GOPROXY_PEER_LAPTOP=<laptop public>
+GOPROXY_PEER_LAPTOP_PUBLIC_KEY=<laptop public>
 GOPROXY_PEER_LAPTOP_IP=10.1.254.10
 
 # --- DC2 --- (same common part, TUN 10.2.254.1/24)
-GOPROXY_PEER_DC1=<DC1 public>
+GOPROXY_PEER_DC1_PUBLIC_KEY=<DC1 public>
 GOPROXY_PEER_DC1_ROUTES=10.1.0.0/16                # DC1 connects to us
-GOPROXY_PEER_DC3=<DC3 public>
+GOPROXY_PEER_DC3_PUBLIC_KEY=<DC3 public>
 GOPROXY_PEER_DC3_ENDPOINT=dc3.example:443
 GOPROXY_PEER_DC3_ROUTES=10.3.0.0/16
-GOPROXY_PEER_LAPTOP=<laptop public>
+GOPROXY_PEER_LAPTOP_PUBLIC_KEY=<laptop public>
 GOPROXY_PEER_LAPTOP_IP=10.2.254.10
 
 # --- DC3 --- (same common part, TUN 10.3.254.1/24)
-GOPROXY_PEER_DC1=<DC1 public>
+GOPROXY_PEER_DC1_PUBLIC_KEY=<DC1 public>
 GOPROXY_PEER_DC1_ROUTES=10.1.0.0/16
-GOPROXY_PEER_DC2=<DC2 public>
+GOPROXY_PEER_DC2_PUBLIC_KEY=<DC2 public>
 GOPROXY_PEER_DC2_ROUTES=10.2.0.0/16
-GOPROXY_PEER_LAPTOP=<laptop public>
+GOPROXY_PEER_LAPTOP_PUBLIC_KEY=<laptop public>
 GOPROXY_PEER_LAPTOP_IP=10.3.254.10
 ```
 
@@ -479,7 +481,7 @@ The laptop connects to one site and routes all three networks through it:
 GOPROXY_PRIVATE_KEY=<laptop private>
 GOPROXY_PSK=a-long-shared-secret
 GOPROXY_TLS_INSECURE=true
-GOPROXY_PEER_DC2=<DC2 public>
+GOPROXY_PEER_DC2_PUBLIC_KEY=<DC2 public>
 GOPROXY_PEER_DC2_ENDPOINT=dc2.example:443
 GOPROXY_PEER_DC2_TRANSPORT=tls
 GOPROXY_PEER_DC2_ROUTES=10.1.0.0/16 10.2.0.0/16 10.3.0.0/16
@@ -501,6 +503,66 @@ so the other sites route replies back through DC2 on their own. To use DC1
 instead, point the peer at DC1 (its public key and endpoint) — nothing else
 changes. Alternatively the laptop may connect to all three sites at once, each
 peer routing only its own site's network.
+
+## Web UI
+
+A node can serve a management page — the status of the node and its peers,
+adding, changing, disabling and removing peers, the node's settings and key,
+and the [connection log](#connection-log):
+
+```bash
+GOPROXY_WEB_LISTEN=127.0.0.1:8080      # where the page is served
+GOPROXY_WEB_PASSWORD=a-long-password   # required
+GOPROXY_WEB_TLS=true                   # optional: HTTPS with a self-signed certificate
+GOPROXY_DATA_DIR=/var/lib/goproxy      # where peers added in the UI are kept
+```
+
+- **Peers from the environment** are shown read-only; peers added in the UI are
+  saved in `$GOPROXY_DATA_DIR/peers.json` and applied at once, without a
+  restart. Changing a peer's routes, NAT or keepalive keeps its sessions; a
+  new key, PSK, handed-out IP or endpoint reconnects it. A peer can be
+  **disabled** instead of deleted: it stays configured but is not connected or
+  accepted, and its routes may repeat an enabled peer's (a standby to switch
+  to by hand). In the environment: `GOPROXY_PEER_<NAME>_DISABLED=true`.
+  Without a data directory the page only shows status.
+- **Settings** — `GOPROXY_NAME`, `GOPROXY_LISTEN`, `GOPROXY_TRANSPORT`,
+  `GOPROXY_PSK`, `GOPROXY_TLS_HOST`, `GOPROXY_TUN_ADDRESS`,
+  `GOPROXY_PUSH_ROUTES`, `GOPROXY_MASQUERADE`, `GOPROXY_MASQUERADE_IPS` and
+  `GOPROXY_LOG_CONNECTIONS` — can be made on the page when the environment
+  leaves them unset (a value from the environment wins and is shown
+  read-only). They are kept in `$GOPROXY_DATA_DIR/settings.json`. Saving
+  restarts the node in place (it re-executes itself; routes and rules are
+  removed and set up again); if it then cannot start — say the listen address
+  is not on this host — it restores the previous settings and starts with
+  those, so a bad setting cannot lock the page out. Connections through the
+  node drop for a moment; UDP peers can take up to ~90 s to notice.
+- **This node's key** may come from the data directory instead of
+  `GOPROXY_PRIVATE_KEY`: it is generated on first start (`node.key`), shown
+  on the page, and can be replaced there — generated anew or pasted (e.g. to
+  move a node to another host). A key from the environment is shown read-only.
+- **New peers:** *Сгенерировать пару* creates the peer's key pair, *Свободный IP*
+  picks the next unused address of the TUN network, and after saving the page
+  shows the peer's side of the configuration (env or docker-compose) with its
+  private key — shown once and not stored on the node. *Конфиг* on any peer
+  shows it again, with a placeholder for the key.
+- **Security:** a login gives an `HttpOnly`, `SameSite=Strict` session cookie
+  (12 h, survives a restart of the node, ends with a password change); changes need a JSON request with the `X-Goproxy` header, so another
+  site cannot make them; wrong passwords are answered after a second, one at a
+  time. The page can change who may connect: listen on `127.0.0.1` or a LAN
+  address rather than a public one (or put it behind a reverse proxy), and use
+  `GOPROXY_WEB_TLS=true` when the password crosses a network. The data
+  directory holds secrets (the key, PSKs) and is written with mode 0600.
+
+With Docker, keep the data directory on a volume:
+
+```yaml
+    environment:
+      GOPROXY_DATA_DIR: /var/lib/goproxy
+      GOPROXY_WEB_LISTEN: 127.0.0.1:8080
+      GOPROXY_WEB_PASSWORD: a-long-password
+    volumes:
+      - ./data:/var/lib/goproxy
+```
 
 ## Connection log
 
@@ -670,8 +732,9 @@ fallback.
 
 ## Security model
 
-- Only nodes whose **public key** is listed as a `GOPROXY_PEER_<NAME>` can
-  complete the handshake — that is the authorization. Remove a peer to revoke it.
+- Only nodes whose **public key** is listed as a peer (`GOPROXY_PEER_<NAME>_PUBLIC_KEY`
+  or added in the web UI) can complete the handshake — that is the
+  authorization. Remove a peer to revoke it.
 - The optional **PSK** adds a shared secret; with the `aead` transport it also
   means a prober without the PSK cannot even elicit a valid response.
 - Forward secrecy: session keys come from ephemeral X25519 and are discarded when

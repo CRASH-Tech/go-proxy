@@ -27,6 +27,15 @@ const (
 // maxFlows bounds the table; beyond it, new flows are not logged.
 const maxFlows = 65536
 
+// recentLines is how many log lines Recent keeps (for the web UI).
+const recentLines = 1000
+
+// Entry is one logged line.
+type Entry struct {
+	Time time.Time `json:"time"`
+	Text string    `json:"text"`
+}
+
 type key struct {
 	proto      uint8
 	src, dst   [4]byte
@@ -41,6 +50,35 @@ type Logger struct {
 	flows map[key]time.Time      // expiry
 	v6    map[[32]byte]time.Time // blocked IPv6 src||dst, expiry
 	full  bool
+
+	recentMu sync.Mutex
+	recent   []Entry // ring of the last recentLines lines
+	next     int
+}
+
+// emit writes a line to the log and keeps it for Recent.
+func (l *Logger) emit(format string, args ...any) {
+	text := fmt.Sprintf(format, args...)
+	l.logf("%s", text)
+	l.recentMu.Lock()
+	e := Entry{Time: time.Now(), Text: text}
+	if len(l.recent) < recentLines {
+		l.recent = append(l.recent, e)
+	} else {
+		l.recent[l.next] = e
+	}
+	l.next = (l.next + 1) % recentLines
+	l.recentMu.Unlock()
+}
+
+// Recent returns the last logged lines, oldest first.
+func (l *Logger) Recent() []Entry {
+	l.recentMu.Lock()
+	defer l.recentMu.Unlock()
+	if len(l.recent) < recentLines {
+		return append([]Entry(nil), l.recent...)
+	}
+	return append(append([]Entry(nil), l.recent[l.next:]...), l.recent[:l.next]...)
 }
 
 // New returns a Logger writing through logf (e.g. log.Printf).
@@ -72,7 +110,7 @@ func (l *Logger) Blocked(pkt []byte) {
 		if !known {
 			src := netip.AddrFrom16([16]byte(pkt[8:24]))
 			dst := netip.AddrFrom16([16]byte(pkt[24:40]))
-			l.logf("conn ipv6 %s -> %s blocked", src, dst)
+			l.emit("conn ipv6 %s -> %s blocked", src, dst)
 		}
 		return
 	}
@@ -111,14 +149,14 @@ func (l *Logger) touch(k, rev key, start bool, how string) {
 		l.full = true
 		l.mu.Unlock()
 		if warn {
-			l.logf("conn: connection table full (%d flows), new connections are not logged", maxFlows)
+			l.emit("conn: connection table full (%d flows), new connections are not logged", maxFlows)
 		}
 		return
 	}
 	l.flows[k] = now.Add(idle)
 	l.mu.Unlock()
 
-	l.logf("conn %s %s %s", protoName(k.proto), arrow(k), how)
+	l.emit("conn %s %s %s", protoName(k.proto), arrow(k), how)
 }
 
 // Expire forgets flows idle past their timeout.

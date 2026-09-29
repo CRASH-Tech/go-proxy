@@ -23,12 +23,15 @@ import (
 	"os"
 	"os/signal"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"syscall"
 
 	"goproxy/internal/config"
 	"goproxy/internal/keys"
 	"goproxy/internal/node"
 	"goproxy/internal/transport"
+	"goproxy/internal/web"
 )
 
 func main() {
@@ -116,22 +119,77 @@ func cmdGencert(args []string) {
 }
 
 func cmdNode() {
+	dataDir := os.Getenv("GOPROXY_DATA_DIR")
+	pending := config.SettingsPending(dataDir) // settings just changed in the web UI
+
+	// failed handles an error before the node is up: after a settings change
+	// in the web UI it restores the previous settings and starts again, so a
+	// bad setting cannot lock the UI out.
+	failed := func(what string, err error) {
+		if pending {
+			log.Printf("%s: %v", what, err)
+			if rerr := config.RollbackSettings(dataDir); rerr == nil {
+				log.Printf("the settings changed in the web UI did not work: restored the previous ones")
+				restart()
+			}
+		}
+		log.Fatalf("%s: %v", what, err)
+	}
+
 	cfg, err := config.LoadNode()
 	if err != nil {
-		log.Fatalf("node: %v", err)
+		failed("node", err)
 	}
 	n, err := node.New(cfg)
 	if err != nil {
-		log.Fatalf("node: %v", err)
+		failed("node", err)
+	}
+	n.OnStarted = func() { // called from Run, on this goroutine
+		if pending {
+			config.ConfirmSettings(dataDir)
+			pending = false
+			log.Printf("the settings changed in the web UI are in effect")
+		}
 	}
 
 	stop := make(chan struct{})
-	go handleSignals(func() { close(stop) })
+	var stopOnce sync.Once
+	shutdown := func() { stopOnce.Do(func() { close(stop) }) }
+	var restarting atomic.Bool
+	go handleSignals(shutdown)
 
-	if err := n.Run(stop); err != nil {
-		log.Fatalf("node: %v", err)
+	stopWeb := func() {}
+	if cfg.WebListen != "" {
+		requestRestart := func() {
+			restarting.Store(true)
+			shutdown()
+		}
+		if stopWeb, err = web.Start(cfg, n, requestRestart); err != nil {
+			failed("web UI", err)
+		}
+	}
+
+	runErr := n.Run(stop)
+	stopWeb()
+	if restarting.Load() {
+		log.Printf("restarting to apply the new settings...")
+		restart()
+	}
+	if runErr != nil {
+		failed("node", runErr)
 	}
 	log.Printf("shut down cleanly")
+}
+
+// restart replaces this process with a fresh copy of itself (same PID, same
+// environment), which reads its configuration again.
+func restart() {
+	exe, err := os.Executable()
+	if err != nil {
+		log.Fatalf("restart: %v", err)
+	}
+	err = syscall.Exec(exe, os.Args, os.Environ())
+	log.Fatalf("restart: %v", err)
 }
 
 func handleSignals(onSignal func()) {
@@ -145,7 +203,13 @@ func handleSignals(onSignal func()) {
 const envReference = `goproxy environment variables (goproxy node)
 
 node:
-  GOPROXY_PRIVATE_KEY        this node's X25519 private key (base64)   [required]
+  GOPROXY_PRIVATE_KEY        this node's X25519 private key (base64); may be
+                             left out with GOPROXY_DATA_DIR (generated and kept
+                             there on first start)
+  GOPROXY_NAME               this node's name in configs generated for peers
+                             (default: the hostname)
+  GOPROXY_DATA_DIR           directory for the peers managed in the web UI
+                             (peers.json) and a generated key (node.key)
   GOPROXY_IFNAME             TUN device name          (default: goproxy0)
   GOPROXY_TUN_ADDRESS        TUN address; its network is where handed-out peer
                              IPs live               (default: 10.255.255.1/32)
@@ -177,6 +241,20 @@ node:
   GOPROXY_OBFS_MAX_PAD       max random padding bytes per record (default: 255)
   GOPROXY_OBFS_COVER         send randomised cover traffic       (default: true)
 
+web UI (optional):
+  GOPROXY_WEB_LISTEN         address of the management UI, e.g. 127.0.0.1:8080
+  GOPROXY_WEB_PASSWORD       its password                     [required with it]
+  GOPROXY_WEB_TLS            serve it over HTTPS with a self-signed certificate
+                             (default: false)
+  Peers added in the UI are saved in GOPROXY_DATA_DIR and applied at once;
+  peers from the environment are shown read-only. These settings can be made
+  in the UI too, when the environment leaves them unset: GOPROXY_NAME,
+  GOPROXY_LISTEN, GOPROXY_TRANSPORT, GOPROXY_PSK, GOPROXY_TLS_HOST,
+  GOPROXY_TUN_ADDRESS, GOPROXY_PUSH_ROUTES, GOPROXY_MASQUERADE,
+  GOPROXY_MASQUERADE_IPS, GOPROXY_LOG_CONNECTIONS (kept in settings.json;
+  saving restarts the node, which restores the previous ones if it cannot
+  start with them). The node's key can be generated or pasted there.
+
 accepting peers (optional):
   GOPROXY_LISTEN             listen address, e.g. 0.0.0.0:443 (default: none)
   GOPROXY_TRANSPORT          aead | tls | udp         (default: aead)
@@ -197,7 +275,7 @@ accepting peers (optional):
                              reverse-proxied; e.g. a local nginx or a real site)
 
 peers (one or more):
-  GOPROXY_PEER_<NAME>              peer's X25519 public key (declares a peer)
+  GOPROXY_PEER_<NAME>_PUBLIC_KEY   peer's X25519 public key (declares a peer)
   GOPROXY_PEER_<NAME>_ROUTES       IPv4 CIDRs behind the peer (comma/space):
                                    packets to them are sent to it, and it may
                                    only send from them. 0.0.0.0/0 = everything
@@ -215,20 +293,22 @@ peers (one or more):
   GOPROXY_PEER_<NAME>_SNI          tls SNI              (default: GOPROXY_TLS_SNI)
   GOPROXY_PEER_<NAME>_INSECURE     accept self-signed   (default: GOPROXY_TLS_INSECURE)
   GOPROXY_PEER_<NAME>_KEEPALIVE    cover/keepalive seconds (default: GOPROXY_KEEPALIVE, 25)
+  GOPROXY_PEER_<NAME>_DISABLED     true: keep the peer configured but unused; its
+                                   routes may then repeat an enabled peer's
 
   Each peer needs _ROUTES and/or _IP; a prefix may belong to one peer only.
   Every packet entering the TUN goes to the peer with the longest matching
   route; packets matching none (and all IPv6) are BLOCKED (answered with ICMP
   "administratively prohibited"). The node changes no sysctls or iptables,
   and host routes only with GOPROXY_PUSH_ROUTES -- see the README.
-  <NAME> is any label without '_' (e.g. DC2, LAPTOP).
+  <NAME>: letters, digits, '-' and '_' (e.g. DC2, LAPTOP).
 
 examples:
   exit server:  GOPROXY_LISTEN=0.0.0.0:443 GOPROXY_TUN_ADDRESS=10.8.0.1/24 GOPROXY_MASQUERADE=eth0
-                GOPROXY_PEER_LAPTOP=<pub> GOPROXY_PEER_LAPTOP_IP=10.8.0.2
-  its client:   GOPROXY_PEER_EXIT=<pub> GOPROXY_PEER_EXIT_ENDPOINT=exit.example:443
+                GOPROXY_PEER_LAPTOP_PUBLIC_KEY=<pub> GOPROXY_PEER_LAPTOP_IP=10.8.0.2
+  its client:   GOPROXY_PEER_EXIT_PUBLIC_KEY=<pub> GOPROXY_PEER_EXIT_ENDPOINT=exit.example:443
                 GOPROXY_PEER_EXIT_ROUTES=0.0.0.0/0
   site mesh:    GOPROXY_LISTEN=0.0.0.0:443 GOPROXY_TUN_ADDRESS=10.1.254.1/24
-                GOPROXY_PEER_DC2=<pub> GOPROXY_PEER_DC2_ENDPOINT=dc2.example:443
+                GOPROXY_PEER_DC2_PUBLIC_KEY=<pub> GOPROXY_PEER_DC2_ENDPOINT=dc2.example:443
                 GOPROXY_PEER_DC2_ROUTES=10.2.0.0/16
 `

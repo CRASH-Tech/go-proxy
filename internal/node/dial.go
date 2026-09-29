@@ -12,9 +12,10 @@ import (
 	"goproxy/internal/transport"
 )
 
-// dialLoop keeps an outbound session to p, reconnecting on failure, until quit
-// is closed.
-func (n *Node) dialLoop(p *peer, quit <-chan struct{}) {
+// dialLoop keeps an outbound session to p, reconnecting on failure, until the
+// peer is shut down (removed, changed, or the node stops).
+func (n *Node) dialLoop(p *peer) {
+	quit := p.stop
 	backoff := time.Second
 	connected := false
 	for {
@@ -26,7 +27,7 @@ func (n *Node) dialLoop(p *peer, quit <-chan struct{}) {
 
 		sess, hello, err := n.connect(p)
 		if err != nil {
-			log.Printf("[%s] connect to %s failed: %v (retrying in %s)", p.name, p.cfg.Endpoint, err, backoff)
+			log.Printf("[%s] connect to %s failed: %v (retrying in %s)", p.name, p.conf().Endpoint, err, backoff)
 			if sleep(quit, backoff) {
 				return
 			}
@@ -55,8 +56,11 @@ func (n *Node) dialLoop(p *peer, quit <-chan struct{}) {
 
 		l := n.newLink(p, true, sess, mtu)
 		l.localIP = localIP
+		l.remote = p.conf().Endpoint
 		l.closeFn = func() { sess.Close() }
-		p.attach(l)
+		if !p.adopt(l) {
+			return
+		}
 		n.startLink(l)
 
 		as := "addresses kept"
@@ -64,14 +68,14 @@ func (n *Node) dialLoop(p *peer, quit <-chan struct{}) {
 			as = "tunnel IP " + hello.ClientIP
 		}
 		if !connected {
-			log.Printf("[%s] connected to %s (%s)", p.name, p.cfg.Endpoint, as)
+			log.Printf("[%s] connected to %s (%s)", p.name, p.conf().Endpoint, as)
 			if mtu < n.cfg.MTU {
 				log.Printf("[%s] warning: peer MTU %d < GOPROXY_MTU %d; lower GOPROXY_MTU if large packets stall",
 					p.name, mtu, n.cfg.MTU)
 			}
 			connected = true
 		} else {
-			log.Printf("[%s] reconnected to %s (%s)", p.name, p.cfg.Endpoint, as)
+			log.Printf("[%s] reconnected to %s (%s)", p.name, p.conf().Endpoint, as)
 		}
 
 		for {
@@ -95,10 +99,10 @@ func (n *Node) connect(p *peer) (noise.Tunnel, *protocol.ServerHello, error) {
 
 	var conn net.Conn
 	var err error
-	if p.cfg.Transport == "udp" {
-		conn, err = transport.ClientDialer("udp", n.cfg.FwMark).Dial("udp", p.cfg.Endpoint)
+	if p.conf().Transport == "udp" {
+		conn, err = transport.ClientDialer("udp", n.cfg.FwMark).Dial("udp", p.conf().Endpoint)
 	} else {
-		conn, err = p.tr.Dial(p.cfg.Endpoint)
+		conn, err = p.tr.Dial(p.conf().Endpoint)
 	}
 	if err != nil {
 		return nil, nil, err
@@ -107,10 +111,10 @@ func (n *Node) connect(p *peer) (noise.Tunnel, *protocol.ServerHello, error) {
 
 	var sess noise.Tunnel
 	var payload []byte
-	if p.cfg.Transport == "udp" {
-		sess, payload, err = noise.InitiatePacket(conn, n.priv, p.pub, p.psk, hello.Marshal())
+	if p.conf().Transport == "udp" {
+		sess, payload, err = noise.InitiatePacket(conn, n.privKey(), p.pub, p.psk, hello.Marshal())
 	} else {
-		sess, payload, err = noise.Initiate(conn, n.priv, p.pub, p.psk, hello.Marshal())
+		sess, payload, err = noise.Initiate(conn, n.privKey(), p.pub, p.psk, hello.Marshal())
 	}
 	if err != nil {
 		conn.Close()

@@ -1,0 +1,223 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>goproxy</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' rx='3' fill='%232563eb'/%3E%3Cpath d='M4 8h8M9 5l3 3-3 3' stroke='white' stroke-width='1.6' fill='none'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<div id="login" class="login" hidden>
+  <form id="login-form" class="card narrow">
+    <h1>goproxy</h1>
+    <label>Password
+      <input type="password" id="login-password" autocomplete="current-password" required>
+    </label>
+    <button type="submit" class="primary">Sign in</button>
+    <p id="login-error" class="error"></p>
+  </form>
+</div>
+
+<div id="restarting" class="overlay" hidden>
+  <div class="card narrow">
+    <h2>Restarting…</h2>
+    <p class="note" id="restarting-text">Applying settings.</p>
+  </div>
+</div>
+
+<div id="app" hidden>
+  <header>
+    <div class="brand">goproxy <span id="node-name" class="muted"></span></div>
+    <button id="logout" class="ghost">Sign out</button>
+  </header>
+  <main>
+    <p id="banner" class="warn" hidden></p>
+
+    <section class="card">
+      <div class="card-head">
+        <h2>This node</h2>
+        <button id="open-settings" class="primary">Settings</button>
+      </div>
+      <div id="node-facts"></div>
+    </section>
+
+    <section class="card">
+      <div class="card-head">
+        <h2>Peers</h2>
+        <button id="add-peer" class="primary">Add peer</button>
+      </div>
+      <p id="readonly-note" class="note" hidden>
+        Read-only: no data directory configured.
+      </p>
+      <div class="table-wrap">
+        <table id="peers">
+          <thead><tr>
+            <th>Name</th><th>Status</th><th>Routes</th><th>Connection</th><th class="traffic">Traffic</th><th></th>
+          </tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="card">
+      <div class="card-head">
+        <h2>Connection log</h2>
+        <input id="conn-filter" type="search" placeholder="Filter">
+      </div>
+      <p id="conn-disabled" class="note" hidden>
+        Connection logging is disabled (Settings → Log connections).
+      </p>
+      <pre id="connections" class="log"></pre>
+    </section>
+  </main>
+</div>
+
+<dialog id="peer-dialog">
+  <form id="peer-form" method="dialog">
+    <h2 id="peer-title">Peer</h2>
+    <label>Name
+      <input name="name" required maxlength="32" pattern="[A-Za-z0-9_\-]+" placeholder="DC2">
+      <small>[A-Za-z0-9_-], up to 32 characters.</small>
+    </label>
+
+    <h3>Connection</h3>
+    <label>Endpoint
+      <input name="endpoint" placeholder="host:port">
+      <small>Empty: inbound only.</small>
+    </label>
+    <div class="grid2">
+      <label>Transport
+        <select name="transport">
+          <option value="">node default</option>
+          <option value="aead">aead</option>
+          <option value="tls">tls</option>
+          <option value="udp">udp</option>
+        </select>
+      </label>
+      <label>PSK
+        <input name="psk" placeholder="node default" autocomplete="off">
+      </label>
+    </div>
+    <div class="grid2 tls-only">
+      <label>TLS SNI
+        <input name="sni" placeholder="www.microsoft.com">
+      </label>
+      <label class="check"><input type="checkbox" name="insecure"> Skip certificate verification</label>
+    </div>
+    <label>Public key
+      <div class="row">
+        <input name="public_key" required class="mono" placeholder="base64">
+        <button type="button" id="gen-keypair">Generate key pair</button>
+      </div>
+      <small id="keypair-note" hidden class="ok">The private key is shown in the peer configuration after saving.</small>
+    </label>
+
+    <h3>Routing</h3>
+    <label>Allowed networks
+      <input name="routes" placeholder="10.2.0.0/16 192.168.50.0/24">
+      <small>Routed to the peer and accepted as source addresses from it. Longest prefix wins.</small>
+    </label>
+    <label>Assigned tunnel IP
+      <div class="row">
+        <input name="ip" placeholder="10.8.0.2">
+        <button type="button" id="next-ip">Next free</button>
+      </div>
+      <small>Sent to the peer in the handshake; the peer translates its TUN address to it.</small>
+    </label>
+    <label class="check"><input type="checkbox" name="nat"> Source NAT forwarded traffic to the node address</label>
+    <label class="check"><input type="checkbox" name="enabled" checked> Enabled</label>
+
+    <input type="hidden" name="keepalive_saved">
+    <p id="peer-error" class="error"></p>
+    <div class="actions">
+      <button type="button" class="ghost" data-close>Cancel</button>
+      <button type="submit" class="primary">Save</button>
+    </div>
+  </form>
+</dialog>
+
+<dialog id="config-dialog">
+  <div class="dialog-body">
+    <h2>Config for peer <span id="config-peer" class="mono"></span></h2>
+    <p class="note">Peer-side configuration.</p>
+    <div class="grid2">
+      <label>Node endpoint
+        <input id="cfg-endpoint" placeholder="host:port">
+      </label>
+      <label>Peer name of this node
+        <input id="cfg-name" maxlength="32">
+      </label>
+    </div>
+    <label>Allowed networks via this node
+      <input id="cfg-routes">
+    </label>
+    <label class="check"><input type="checkbox" id="cfg-all"> Default route (0.0.0.0/0)</label>
+    <div class="tabs">
+      <label><input type="radio" name="cfg-format" value="env" checked> env</label>
+      <label><input type="radio" name="cfg-format" value="compose"> docker-compose</label>
+    </div>
+    <textarea id="cfg-output" class="mono" readonly rows="14"></textarea>
+    <p id="cfg-secret" class="warn" hidden>Contains the peer's private key. It is not stored on this node and will not be shown again.</p>
+    <div class="actions">
+      <button type="button" id="cfg-copy" class="copy"></button>
+      <button type="button" class="primary" data-close>Done</button>
+    </div>
+  </div>
+</dialog>
+
+<dialog id="settings-dialog" class="wide">
+  <div class="dialog-body">
+    <h2>Node settings</h2>
+
+    <h3>Node key</h3>
+    <div class="value-box">
+      <code id="key-public" class="big"></code>
+      <div class="box-actions" id="key-actions"></div>
+    </div>
+    <p id="key-env" class="note" hidden>
+      Set by the environment; read-only.
+    </p>
+    <form id="key-form">
+      <label>Private key
+        <div class="row">
+          <input id="key-private" class="mono" required autocomplete="off" spellcheck="false"
+                 placeholder="base64">
+          <button type="submit">Set key</button>
+        </div>
+        <small>Applied immediately.</small>
+      </label>
+      <p id="key-error" class="error"></p>
+    </form>
+
+    <h3>Settings</h3>
+    <p class="note">
+      Environment variables take precedence and are read-only. Saving restarts the node;
+      on startup failure the previous settings are restored.
+    </p>
+    <p id="settings-readonly" class="note" hidden>
+      Read-only: no data directory configured.
+    </p>
+    <form id="settings-form" class="settings-grid"></form>
+    <p id="settings-error" class="error"></p>
+    <div class="actions">
+      <button type="button" class="ghost" data-close>Close</button>
+      <button type="button" id="settings-save" class="primary">Save and restart</button>
+    </div>
+  </div>
+</dialog>
+
+<dialog id="confirm-dialog">
+  <div class="dialog-body">
+    <p id="confirm-text"></p>
+    <div class="actions">
+      <button type="button" class="ghost" data-close>Cancel</button>
+      <button type="button" id="confirm-ok" class="danger">Yes</button>
+    </div>
+  </div>
+</dialog>
+
+<script src="app.js"></script>
+</body>
+</html>

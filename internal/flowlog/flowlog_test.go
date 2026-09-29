@@ -136,3 +136,17 @@ func TestIgnoresFragmentsAndGarbage(t *testing.T) {
 		t.Fatalf("lines = %q", c.lines)
 	}
 }
+
+func TestRecent(t *testing.T) {
+	l := New(func(string, ...any) {})
+	for i := 0; i < recentLines+5; i++ {
+		l.Seen(ip4(protoUDP, client, server, ports(uint16(1000+i), 53)), "via EXIT")
+	}
+	r := l.Recent()
+	if len(r) != recentLines {
+		t.Fatalf("%d lines kept, want %d", len(r), recentLines)
+	}
+	if !strings.Contains(r[0].Text, ":1005 ") || !strings.Contains(r[len(r)-1].Text, fmt.Sprintf(":%d ", 1000+recentLines+4)) {
+		t.Fatalf("not the latest lines in order: first %q, last %q", r[0].Text, r[len(r)-1].Text)
+	}
+}

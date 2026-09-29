@@ -20,6 +20,12 @@ services:
       - NET_ADMIN
     devices:
       - /dev/net/tun:/dev/net/tun
+    # Web UI and peers managed in it (set GOPROXY_DATA_DIR=/var/lib/goproxy,
+    # GOPROXY_WEB_LISTEN and GOPROXY_WEB_PASSWORD in the env file):
+    # volumes:
+    #   - ./data:/var/lib/goproxy
+    # ports:
+    #   - "127.0.0.1:8080:8080"     # with GOPROXY_WEB_LISTEN=0.0.0.0:8080
     # IP forwarding in the container's own network namespace (namespaced sysctl).
     sysctls:
       net.ipv4.ip_forward: "1"

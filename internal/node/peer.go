@@ -19,12 +19,20 @@ import (
 // us (inbound) and one we opened to it (outbound). Both may be up at once when
 // each side has the other's endpoint; the outbound one is then preferred.
 type peer struct {
-	cfg  *config.Peer
-	name string
-	pub  keys.PublicKey
-	psk  [32]byte
-	tr   transport.Transport // stream transport for dialing; nil for udp or no endpoint
-	nat  *nat.Table          // source NAT of clients' traffic to the peer; nil = off
+	// Fixed for the peer's lifetime: what its sessions are built on.
+	name   string
+	source string // "env" or "file"
+	pub    keys.PublicKey
+	psk    [32]byte
+	tr     transport.Transport // stream transport for dialing; nil for udp or no endpoint
+
+	// Replaced in place when only settings sessions do not depend on change
+	// (routes, NAT, keepalive): see sessionEqual.
+	cfg  atomic.Pointer[config.Peer]
+	natp atomic.Pointer[nat.Table] // source NAT of clients' traffic to the peer; nil = off
+
+	stop     chan struct{} // closed when the peer is removed or the node stops
+	stopOnce sync.Once
 
 	mu  sync.Mutex
 	in  *link
@@ -36,11 +44,8 @@ func newPeer(pc *config.Peer, mark int, tunIP [4]byte) (*peer, error) {
 	if err != nil {
 		return nil, err
 	}
-	p := &peer{cfg: pc, name: pc.Name, pub: pub, psk: config.DerivePSK(pc.PSK)}
-	if pc.NAT {
-		p.nat = nat.New(tunIP)
-		p.nat.Warn = func(msg string) { log.Printf("[%s] warning: %s", pc.Name, msg) }
-	}
+	p := &peer{name: pc.Name, pub: pub, psk: config.DerivePSK(pc.PSK), stop: make(chan struct{})}
+	p.update(pc, tunIP)
 	if pc.Endpoint != "" {
 		switch pc.Transport {
 		case "aead":
@@ -54,6 +59,34 @@ func newPeer(pc *config.Peer, mark int, tunIP [4]byte) (*peer, error) {
 		}
 	}
 	return p, nil
+}
+
+// conf returns the peer's current configuration.
+func (p *peer) conf() *config.Peer { return p.cfg.Load() }
+
+// natTable returns the peer's NAT table, or nil when NAT is off.
+func (p *peer) natTable() *nat.Table { return p.natp.Load() }
+
+// update applies a configuration that differs from the current one at most
+// in settings sessions do not depend on. A NAT table is kept while NAT stays on.
+func (p *peer) update(pc *config.Peer, tunIP [4]byte) {
+	switch {
+	case !pc.NAT:
+		p.natp.Store(nil)
+	case p.natp.Load() == nil:
+		t := nat.New(tunIP)
+		t.Warn = func(msg string) { log.Printf("[%s] warning: %s", pc.Name, msg) }
+		p.natp.Store(t)
+	}
+	p.cfg.Store(pc)
+}
+
+// sessionEqual reports whether two configurations of a peer can share its
+// sessions: the key, PSK and handed-out IP are part of the handshake, and the
+// endpoint, transport and TLS settings of the outbound connection.
+func sessionEqual(a, b *config.Peer) bool {
+	return a.Name == b.Name && a.PublicKey == b.PublicKey && a.PSK == b.PSK && a.IP == b.IP &&
+		a.Endpoint == b.Endpoint && a.Transport == b.Transport && a.TLS == b.TLS
 }
 
 // active returns the session to send through, preferring the outbound one.
@@ -94,6 +127,33 @@ func (p *peer) detach(l *link) {
 	}
 }
 
+// shutdown stops the peer for good: its dial loop ends and its sessions close.
+func (p *peer) shutdown() {
+	p.stopOnce.Do(func() { close(p.stop) })
+	p.closeAll()
+}
+
+// stopped reports whether the peer was shut down.
+func (p *peer) stopped() bool {
+	select {
+	case <-p.stop:
+		return true
+	default:
+		return false
+	}
+}
+
+// adopt attaches a new session to p unless p has been shut down meanwhile (a
+// peer removed while its handshake was in flight); it reports whether it did.
+func (p *peer) adopt(l *link) bool {
+	p.attach(l)
+	if p.stopped() {
+		l.close()
+		return false
+	}
+	return true
+}
+
 func (p *peer) closeAll() {
 	p.mu.Lock()
 	in, out := p.in, p.out
@@ -114,7 +174,7 @@ func (p *peer) send(pkt []byte, tunIP [4]byte) {
 	}
 	// Clients' traffic first takes the TUN address (NAT), which is then
 	// translated to the IP the peer assigned to us, like the node's own.
-	if p.nat != nil && !p.nat.Out(pkt) {
+	if nt := p.natTable(); nt != nil && !nt.Out(pkt) {
 		return
 	}
 	if l.localIP != 0 {
@@ -157,6 +217,12 @@ type link struct {
 	done     chan struct{}
 	once     sync.Once
 	lastSeen atomic.Int64 // unix nanos of the last datagram (accepted udp links)
+
+	// For the status page.
+	remote string    // the peer's address
+	since  time.Time // when the session was established
+	rx, tx atomic.Uint64
+	lastRx atomic.Int64 // unix nanos of the last packet from the peer
 }
 
 func (n *Node) newLink(p *peer, outbound bool, sess session, mtu int) *link {
@@ -169,6 +235,7 @@ func (n *Node) newLink(p *peer, outbound bool, sess session, mtu int) *link {
 		mss:      uint16(min(mtu, n.cfg.MTU) - 40),
 		queue:    make(chan []byte, 512),
 		done:     make(chan struct{}),
+		since:    time.Now(),
 	}
 }
 
@@ -185,10 +252,11 @@ func (n *Node) startLink(l *link) {
 					l.close()
 					return
 				}
+				l.tx.Add(uint64(len(pkt)))
 			}
 		}
 	}()
-	ka := time.Duration(l.p.cfg.KeepaliveSec) * time.Second
+	ka := time.Duration(l.p.conf().KeepaliveSec) * time.Second
 	if n.cfg.ObfsCover {
 		go l.sess.RunCover(ka, noise.CoverMaxJunk, l.done)
 	} else {
