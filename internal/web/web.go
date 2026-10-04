@@ -458,6 +458,7 @@ func clean(p config.Peer) config.Peer {
 	p.PublicKey = strings.TrimSpace(p.PublicKey)
 	p.IP = strings.TrimSpace(p.IP)
 	p.Endpoint = strings.TrimSpace(p.Endpoint)
+	p.Interface = strings.TrimSpace(p.Interface)
 	p.TLS.SNI = strings.TrimSpace(p.TLS.SNI)
 	var routes []string
 	for _, r := range p.Routes {

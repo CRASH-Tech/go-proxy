@@ -49,6 +49,12 @@ type Peer struct {
 	NAT       bool     `json:"nat,omitempty"`      // translate clients' traffic to the peer to the node's address
 	Disabled  bool     `json:"disabled,omitempty"` // kept in the configuration, but not used
 
+	// Interface, if set, is a TUN device of the peer's own: whatever the host
+	// routes into it goes to the peer, and what the peer sends comes out of
+	// it. Routes then only limit the peer's source addresses; they are not in
+	// the node TUN's route table and may repeat another such peer's.
+	Interface string `json:"interface,omitempty"`
+
 	Transport    string          `json:"transport,omitempty"` // transport used to connect to Endpoint
 	PSK          string          `json:"psk,omitempty"`
 	TLS          TLSClientConfig `json:"tls,omitempty"`
@@ -344,6 +350,7 @@ func LoadNodeWith(settings map[string]string) (*NodeConfig, error) {
 			Endpoint:  strings.TrimSpace(env(base+"_ENDPOINT", "")),
 			NAT:       envBool(base+"_NAT", false),
 			Disabled:  envBool(base+"_DISABLED", false),
+			Interface: strings.TrimSpace(env(base+"_INTERFACE", "")),
 			Transport: env(base+"_TRANSPORT", ""),
 			PSK:       env(base+"_PSK", ""),
 			TLS: TLSClientConfig{
@@ -449,6 +456,11 @@ func (c *NodeConfig) validate() error {
 	if err := ValidatePeers(c.Peers); err != nil {
 		return err
 	}
+	for _, p := range c.Peers {
+		if p.Interface != "" && p.Interface == c.InterfaceName {
+			return fmt.Errorf("peer %q: interface %q is the node's TUN (GOPROXY_IFNAME)", p.Name, p.Interface)
+		}
+	}
 	// Without the web UI the environment must give the node something to do.
 	if c.WebListen == "" {
 		if len(c.Peers) == 0 && c.DataDir == "" {
@@ -463,6 +475,20 @@ func (c *NodeConfig) validate() error {
 		}
 	}
 	return nil
+}
+
+// ValidInterfaceName reports whether name can name a network interface
+// (Linux: up to 15 characters; restricted here to a safe set).
+func ValidInterfaceName(name string) bool {
+	if name == "" || len(name) > 15 || name == "." || name == ".." {
+		return false
+	}
+	for _, r := range name {
+		if !(r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '-' || r == '_' || r == '.') {
+			return false
+		}
+	}
+	return true
 }
 
 // ValidPeerName reports whether name can name a peer: letters, digits, '-'
@@ -481,9 +507,12 @@ func ValidPeerName(name string) bool {
 
 // ValidatePeers checks a set of peers on its own and against each other:
 // names and keys are unique, and a prefix belongs to one enabled peer only
-// (a disabled peer may share its routes, e.g. as a standby).
+// (a disabled peer may share its routes, e.g. as a standby). Peers with an
+// interface of their own are not in the route table: their routes may
+// overlap, but each needs a different interface.
 func ValidatePeers(peers []Peer) error {
 	owner := map[netip.Prefix]string{}
+	ifOwner := map[string]string{}
 	keyOwner := map[keys.PublicKey]string{}
 	names := map[string]bool{}
 	for i := range peers {
@@ -511,8 +540,19 @@ func ValidatePeers(peers []Peer) error {
 		if len(prefixes) == 0 {
 			return fmt.Errorf("peer %q: needs routes and/or an IP", p.Name)
 		}
+		if p.Interface != "" {
+			if !ValidInterfaceName(p.Interface) {
+				return fmt.Errorf("peer %q: interface %q: use letters, digits, '-', '_' and '.' (up to 15)", p.Name, p.Interface)
+			}
+			if other, ok := ifOwner[p.Interface]; ok && !p.Disabled {
+				return fmt.Errorf("peers %q and %q have the same interface %q", other, p.Name, p.Interface)
+			}
+			if !p.Disabled {
+				ifOwner[p.Interface] = p.Name
+			}
+		}
 		for _, pfx := range prefixes {
-			if p.Disabled {
+			if p.Disabled || p.Interface != "" {
 				break
 			}
 			if other, ok := owner[pfx]; ok {

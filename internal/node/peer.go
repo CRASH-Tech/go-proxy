@@ -3,6 +3,7 @@ package node
 import (
 	"fmt"
 	"log"
+	"net/netip"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -13,6 +14,7 @@ import (
 	"goproxy/internal/nat"
 	"goproxy/internal/noise"
 	"goproxy/internal/transport"
+	"goproxy/internal/tun"
 )
 
 // peer is a configured peer and its current sessions: at most one it opened to
@@ -29,7 +31,10 @@ type peer struct {
 	// Replaced in place when only settings sessions do not depend on change
 	// (routes, NAT, keepalive): see sessionEqual.
 	cfg  atomic.Pointer[config.Peer]
-	natp atomic.Pointer[nat.Table] // source NAT of clients' traffic to the peer; nil = off
+	natp atomic.Pointer[nat.Table]      // source NAT of clients' traffic to the peer; nil = off
+	srcs atomic.Pointer[[]netip.Prefix] // its routes: the source addresses it may use
+
+	dev atomic.Pointer[tun.Device] // its own TUN (Interface) while open; nil = none
 
 	stop     chan struct{} // closed when the peer is removed or the node stops
 	stopOnce sync.Once
@@ -78,15 +83,32 @@ func (p *peer) update(pc *config.Peer, tunIP [4]byte) {
 		t.Warn = func(msg string) { log.Printf("[%s] warning: %s", pc.Name, msg) }
 		p.natp.Store(t)
 	}
+	srcs, _ := pc.Prefixes() // validated before
+	p.srcs.Store(&srcs)
 	p.cfg.Store(pc)
 }
 
+// accepts reports whether src is one of the peer's routes.
+func (p *peer) accepts(src [4]byte) bool {
+	a := netip.AddrFrom4(src)
+	for _, pfx := range *p.srcs.Load() {
+		if pfx.Contains(a) {
+			return true
+		}
+	}
+	return false
+}
+
+// device returns the peer's own TUN, or nil.
+func (p *peer) device() *tun.Device { return p.dev.Load() }
+
 // sessionEqual reports whether two configurations of a peer can share its
 // sessions: the key, PSK and handed-out IP are part of the handshake, and the
-// endpoint, transport and TLS settings of the outbound connection.
+// endpoint, transport and TLS settings of the outbound connection. The
+// interface lives as long as the peer object.
 func sessionEqual(a, b *config.Peer) bool {
 	return a.Name == b.Name && a.PublicKey == b.PublicKey && a.PSK == b.PSK && a.IP == b.IP &&
-		a.Endpoint == b.Endpoint && a.Transport == b.Transport && a.TLS == b.TLS
+		a.Endpoint == b.Endpoint && a.Transport == b.Transport && a.TLS == b.TLS && a.Interface == b.Interface
 }
 
 // active returns the session to send through, preferring the outbound one.
@@ -127,10 +149,14 @@ func (p *peer) detach(l *link) {
 	}
 }
 
-// shutdown stops the peer for good: its dial loop ends and its sessions close.
+// shutdown stops the peer for good: its dial loop ends, its sessions close
+// and its own TUN is removed.
 func (p *peer) shutdown() {
 	p.stopOnce.Do(func() { close(p.stop) })
 	p.closeAll()
+	if d := p.dev.Swap(nil); d != nil {
+		d.Close()
+	}
 }
 
 // stopped reports whether the peer was shut down.

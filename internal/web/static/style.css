@@ -195,6 +195,8 @@ tr.disabled td:not(.actions-cell) { opacity: .45; }
 .status-err { color: var(--danger); }
 #peers td:nth-child(2) > div:first-child { white-space: nowrap; }
 .routes { display: flex; flex-wrap: wrap; gap: 4px; }
+.iface { margin-bottom: 6px; color: var(--muted); font-size: 12px; white-space: nowrap; }
+.iface code { color: var(--ok); }
 
 /* --- settings, log, dialogs --- */
 

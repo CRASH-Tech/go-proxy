@@ -111,9 +111,11 @@ Per-peer settings (`GOPROXY_PEER_<NAME>_<FIELD>`):
 | `IP`        | a tunnel IP handed to the peer when it connects; the peer translates its TUN address to it. For clients — see below. Implies a `/32` route. |
 | `ENDPOINT`  | `host:port` to connect to. Without it the node only waits for the peer to connect. |
 | `NAT`       | `true`: traffic of this node's clients sent to the peer leaves with the node's own address (see [NAT for clients](#nat-for-clients)), so the peer needs no routes for them. |
+| `INTERFACE` | a TUN of the peer's own, e.g. `gp-dc1`: a next hop for host routes (see [Peer interfaces](#peer-interfaces)). |
 | `TRANSPORT`, `PSK`, `SNI`, `INSECURE`, `KEEPALIVE` | overrides of `GOPROXY_TRANSPORT`, `GOPROXY_PSK`, `GOPROXY_TLS_SNI`, `GOPROXY_TLS_INSECURE`, `GOPROXY_KEEPALIVE`. |
 
-Every peer needs `ROUTES` and/or `IP`, and a prefix may belong to one peer only.
+Every peer needs `ROUTES` and/or `IP`, and a prefix may belong to one peer only
+(peers with an `INTERFACE` excepted).
 A pair of nodes needs a connection in one direction only — either side may set
 the other's `ENDPOINT`; if both do, both connections are kept and either carries
 the traffic.
@@ -153,6 +155,47 @@ let its road warriors reach another site that has no route to them.
   warning in the log.
 - The node's own traffic is never translated. Other protocols and non-first
   IP fragments pass unchanged.
+
+### Peer interfaces
+
+By default all peers share the node's TUN, and the node picks the peer by
+destination. With `GOPROXY_PEER_<NAME>_INTERFACE=<name>` a peer gets a TUN of
+its own instead — a point-to-point link the host can route into like any
+other, and the node does no routing for it:
+
+- every packet the host routes into the interface goes to that peer, whatever
+  its destination; what the peer sends comes out of the interface;
+- the peer's `ROUTES` only limit the source addresses it may send from
+  (`0.0.0.0/0` for an exit). They are not in the node TUN's route table and not
+  pushed by `GOPROXY_PUSH_ROUTES`, so several such peers may have the same
+  routes — e.g. two exits to choose between, or fail over, by host routes;
+- the interface is created when the peer is added or the node starts (up, MTU
+  as the node TUN, no address), and removed with the peer, when it is disabled,
+  or when the node stops. Its name must not be taken by another interface.
+
+```bash
+GOPROXY_PEER_DC1_PUBLIC_KEY=...
+GOPROXY_PEER_DC1_ENDPOINT=dc1.example.com:443
+GOPROXY_PEER_DC1_ROUTES=0.0.0.0/0
+GOPROXY_PEER_DC1_INTERFACE=gp-dc1
+GOPROXY_PEER_DC2_PUBLIC_KEY=...
+GOPROXY_PEER_DC2_ENDPOINT=dc2.example.com:443
+GOPROXY_PEER_DC2_ROUTES=0.0.0.0/0
+GOPROXY_PEER_DC2_INTERFACE=gp-dc2
+```
+
+```bash
+ip route add 10.1.0.0/16 dev gp-dc1 src 10.8.0.5    # src: the node TUN address
+ip route add 10.2.0.0/16 dev gp-dc2 src 10.8.0.5
+ip route add default dev gp-dc1 table 100           # or policy routing, ECMP, a routing daemon...
+```
+
+The interfaces have no address, so for the host's own traffic give the routes
+`src` with the node TUN address — the address the peer accepts from this node
+(it is translated to the IP the peer hands out, as usual). Forwarded traffic
+keeps its source, which the peer must accept, or set `_NAT=true` for the peer
+(this also covers a host source other than the TUN address). With a strict
+`rp_filter`, a route back to the peer's sources must point into its interface.
 
 Peers can also be managed in the [web UI](#web-ui). Other node settings:
 `GOPROXY_NAME` (this node's name in configs generated for peers; the

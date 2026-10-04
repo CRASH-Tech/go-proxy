@@ -114,9 +114,13 @@
     </label>
 
     <h3>Routing</h3>
+    <label>Interface
+      <input name="interface" maxlength="15" pattern="[A-Za-z0-9_.\-]+" placeholder="node TUN" autocomplete="off" spellcheck="false">
+      <small>Dedicated TUN device for this peer, usable as a next hop in host routes.</small>
+    </label>
     <label>Allowed networks
       <input name="routes" placeholder="10.2.0.0/16">
-      <small>Routed to the peer and accepted as source addresses from it. Longest prefix wins.</small>
+      <small id="routes-help"></small>
     </label>
     <label>Assigned tunnel IP
       <div class="row">

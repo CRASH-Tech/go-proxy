@@ -5,6 +5,8 @@
 // routes contain its destination (longest prefix wins); packets no peer routes
 // are blocked. Which traffic reaches the TUN is up to the host's routes -- set
 // by the admin, or pushed from the peers' routes with GOPROXY_PUSH_ROUTES.
+// A peer may instead have a TUN of its own (Interface): a next hop for the
+// host's routes, outside the node TUN's route table.
 // NAT to the internet is the host's too, or GOPROXY_MASQUERADE; forwarding
 // (ip_forward) is always the admin's.
 //
@@ -16,6 +18,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"net"
 	"net/netip"
 	"os"
 	"reflect"
@@ -157,6 +160,16 @@ func (n *Node) buildSet(file []config.Peer) (set *peerSet, apply []func(), err e
 		if pc.Disabled {
 			continue
 		}
+		if pc.Interface != "" {
+			if pc.Interface == n.cfg.InterfaceName {
+				return nil, nil, fmt.Errorf("peer %q: interface %q is the node's TUN", pc.Name, pc.Interface)
+			}
+			if !ownsInterface(old, pc.Interface) {
+				if _, err := net.InterfaceByName(pc.Interface); err == nil {
+					return nil, nil, fmt.Errorf("peer %q: interface %q already exists on this host", pc.Name, pc.Interface)
+				}
+			}
+		}
 		var p *peer
 		if old != nil {
 			if op := old.byName[pc.Name]; op != nil && op.source == s.source && sessionEqual(op.conf(), &pc) {
@@ -176,6 +189,9 @@ func (n *Node) buildSet(file []config.Peer) (set *peerSet, apply []func(), err e
 		if err != nil {
 			return nil, nil, fmt.Errorf("peer %q: %w", p.name, err)
 		}
+		if pc.Interface != "" {
+			prefixes = nil // reached through its own interface, not the route table
+		}
 		for _, pfx := range prefixes {
 			if err := set.routes.Insert(pfx, p); err != nil {
 				return nil, nil, fmt.Errorf("peer %q route: %w", p.name, err)
@@ -186,6 +202,19 @@ func (n *Node) buildSet(file []config.Peer) (set *peerSet, apply []func(), err e
 		set.byName[p.name] = p
 	}
 	return set, apply, nil
+}
+
+// ownsInterface reports whether a peer of set has the interface name.
+func ownsInterface(set *peerSet, name string) bool {
+	if set == nil {
+		return false
+	}
+	for _, p := range set.peers {
+		if p.conf().Interface == name {
+			return true
+		}
+	}
+	return false
 }
 
 // privKey returns the node's current static private key.
@@ -256,7 +285,7 @@ func (n *Node) Run(stop <-chan struct{}) error {
 	n.mu.Lock()
 	n.running = true
 	for _, p := range n.set.Load().peers {
-		n.startDial(p)
+		n.startPeer(p)
 	}
 	n.mu.Unlock()
 
@@ -284,9 +313,10 @@ func (n *Node) Run(stop <-chan struct{}) error {
 	return runErr
 }
 
-// startDial runs the outbound connection loop of p, if it has an endpoint.
-// Called with n.mu held while running.
-func (n *Node) startDial(p *peer) {
+// startPeer creates p's own TUN, if it has one, and runs its outbound
+// connection loop, if it has an endpoint. Called with n.mu held while running.
+func (n *Node) startPeer(p *peer) {
+	n.openInterface(p)
 	if p.conf().Endpoint == "" {
 		return
 	}
@@ -306,6 +336,9 @@ func (n *Node) pushRoutes(set *peerSet) error {
 	}
 	var prefixes []netip.Prefix
 	for _, p := range set.peers {
+		if p.conf().Interface != "" {
+			continue // routed into its own interface by the admin
+		}
 		pfx, _ := p.conf().Prefixes() // validated when the set was built
 		prefixes = append(prefixes, pfx...)
 	}
@@ -363,7 +396,7 @@ func (n *Node) SetFilePeers(file []config.Peer) error {
 	if n.running {
 		for _, p := range set.peers {
 			if old.byName[p.name] != p {
-				n.startDial(p)
+				n.startPeer(p)
 			}
 		}
 	}
@@ -409,10 +442,57 @@ func (n *Node) tunReader() {
 	}
 }
 
-// deliver writes a packet received from a peer to the TUN. Its source must be
-// routed to that peer, so a peer cannot inject traffic posing as another
-// peer's (or unrouted) addresses. ICMP errors are exempt -- they come from
-// routers along the path (path-MTU discovery needs them).
+// openInterface creates and brings up p's own TUN (Interface), without an
+// address, and starts reading it. A failure is logged; the peer then works
+// without it (its packets are dropped). Called with n.mu held while running.
+func (n *Node) openInterface(p *peer) {
+	name := p.conf().Interface
+	if name == "" || p.stopped() {
+		return
+	}
+	dev, err := tun.Open(name)
+	if err == nil {
+		if err = dev.Configure("", n.cfg.MTU); err != nil {
+			dev.Close()
+		}
+	}
+	if err != nil {
+		log.Printf("[%s] interface %s: %v", p.name, name, err)
+		return
+	}
+	p.dev.Store(dev)
+	log.Printf("[%s] tun %s up (mtu %d): traffic routed into it goes to the peer", p.name, dev.Name(), n.cfg.MTU)
+	go n.interfaceReader(p, dev)
+}
+
+// interfaceReader sends every packet read from p's own TUN to p, whatever its
+// destination (the host chose this interface), until the device is closed.
+func (n *Node) interfaceReader(p *peer, dev *tun.Device) {
+	buf := make([]byte, 65535)
+	for {
+		m, err := dev.Read(buf)
+		if err != nil {
+			if !errors.Is(err, os.ErrClosed) {
+				log.Printf("[%s] tun %s read: %v", p.name, dev.Name(), err)
+			}
+			return
+		}
+		pkt := buf[:m]
+		if ipx.Version(pkt) != 4 || m < 20 {
+			continue // IPv6 (e.g. router solicitations): not carried
+		}
+		if n.flows != nil {
+			n.flows.Seen(pkt, "via "+p.name)
+		}
+		p.send(append([]byte(nil), pkt...), n.tunIP)
+	}
+}
+
+// deliver writes a packet received from a peer to the TUN -- the peer's own,
+// if it has one. Its source must be routed to that peer (for a peer with an
+// interface: be one of its routes), so a peer cannot inject traffic posing as
+// another peer's (or unrouted) addresses. ICMP errors are exempt -- they come
+// from routers along the path (path-MTU discovery needs them).
 func (n *Node) deliver(l *link, pkt []byte) {
 	if ipx.Version(pkt) != 4 || len(pkt) < 20 {
 		return
@@ -425,14 +505,23 @@ func (n *Node) deliver(l *link, pkt []byte) {
 	if nt := l.p.natTable(); nt != nil {
 		nt.In(pkt)
 	}
-	if owner, ok := n.set.Load().routes.Lookup([4]byte(pkt[12:16])); !(ok && owner == l.p) && !ipx.IsICMPv4Error(pkt) {
+	src := [4]byte(pkt[12:16])
+	dev := n.dev
+	if l.p.conf().Interface != "" {
+		if dev = l.p.device(); dev == nil {
+			return // the interface could not be created (logged)
+		}
+		if !l.p.accepts(src) && !ipx.IsICMPv4Error(pkt) {
+			return
+		}
+	} else if owner, ok := n.set.Load().routes.Lookup(src); !(ok && owner == l.p) && !ipx.IsICMPv4Error(pkt) {
 		return
 	}
 	ipx.ClampMSS(pkt, l.mss)
 	if n.flows != nil {
 		n.flows.Seen(pkt, "from "+l.p.name)
 	}
-	if _, err := n.dev.Write(pkt); err != nil {
+	if _, err := dev.Write(pkt); err != nil && !errors.Is(err, os.ErrClosed) {
 		log.Printf("[%s] tun write: %v", l.p.name, err)
 	}
 }

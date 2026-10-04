@@ -151,3 +151,34 @@ func TestNextFreeIP(t *testing.T) {
 		t.Fatalf("next free = %q, want 10.8.0.4", ip)
 	}
 }
+
+func TestInterfacePeer(t *testing.T) {
+	n, _ := testNode(t)
+	// The env peer EXIT routes 0.0.0.0/0; a peer with its own interface may too.
+	dc := config.Peer{Name: "DC", PublicKey: pub(t), Routes: []string{"0.0.0.0/0"}, Interface: "gp-dc"}
+	if err := n.SetFilePeers([]config.Peer{dc}); err != nil {
+		t.Fatal(err)
+	}
+	set := n.set.Load()
+	if p, _ := set.routes.Lookup([4]byte{1, 1, 1, 1}); p == nil || p.name != "EXIT" {
+		t.Fatalf("1.1.1.1 routed to %v, want EXIT: DC is not in the route table", p)
+	}
+	if p := set.byName["DC"]; !p.accepts([4]byte{1, 1, 1, 1}) {
+		t.Fatal("DC does not accept sources in its routes")
+	}
+	for _, name := range []string{"goproxy0", "lo"} {
+		dc.Interface = name
+		if err := n.SetFilePeers([]config.Peer{dc}); err == nil {
+			t.Errorf("interface %q accepted", name)
+		}
+	}
+	// Changing the interface replaces the peer (and with it the device).
+	old := set.byName["DC"]
+	dc.Interface = "gp-dc2"
+	if err := n.SetFilePeers([]config.Peer{dc}); err != nil {
+		t.Fatal(err)
+	}
+	if n.set.Load().byName["DC"] == old || !old.stopped() {
+		t.Fatal("the peer was kept across an interface change")
+	}
+}

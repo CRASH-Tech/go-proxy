@@ -246,3 +246,43 @@ func TestWebPath(t *testing.T) {
 		}
 	}
 }
+
+func TestInterfacePeers(t *testing.T) {
+	const testPubC = "eK+zmLFBvw0tbc31sENz4bEc8BThdKqjyZN61Yyva1k="
+	a := Peer{Name: "DC1", PublicKey: testPubA, Routes: []string{"0.0.0.0/0"}, Interface: "gp-dc1"}
+	b := Peer{Name: "DC2", PublicKey: testPubB, Routes: []string{"0.0.0.0/0"}, Interface: "gp-dc2"}
+	c := Peer{Name: "EXIT", PublicKey: testPubC, Routes: []string{"0.0.0.0/0"}}
+	if err := ValidatePeers([]Peer{a, b, c}); err != nil {
+		t.Fatalf("peers with own interfaces sharing a route: %v", err)
+	}
+	b.Interface = "gp-dc1"
+	if err := ValidatePeers([]Peer{a, b}); err == nil || !strings.Contains(err.Error(), "same interface") {
+		t.Fatalf("same interface twice: %v", err)
+	}
+	b.Disabled = true
+	if err := ValidatePeers([]Peer{a, b}); err != nil {
+		t.Fatalf("a disabled peer with the same interface: %v", err)
+	}
+	for _, bad := range []string{"has space", "a/b", "sixteen-chars-xx", ".."} {
+		a.Interface = bad
+		if err := ValidatePeers([]Peer{a}); err == nil {
+			t.Errorf("interface %q accepted", bad)
+		}
+	}
+
+	setEnv(t, map[string]string{
+		"GOPROXY_PRIVATE_KEY":         testPriv,
+		"GOPROXY_LISTEN":              "0.0.0.0:443",
+		"GOPROXY_PEER_DC1_PUBLIC_KEY": testPubA,
+		"GOPROXY_PEER_DC1_ROUTES":     "0.0.0.0/0",
+		"GOPROXY_PEER_DC1_INTERFACE":  "gp-dc1",
+	})
+	cfg, err := LoadNode()
+	if err != nil || cfg.Peers[0].Interface != "gp-dc1" {
+		t.Fatalf("_INTERFACE: %v %+v", err, cfg)
+	}
+	t.Setenv("GOPROXY_PEER_DC1_INTERFACE", cfg.InterfaceName)
+	if _, err := LoadNode(); err == nil {
+		t.Fatal("a peer interface named like the node TUN was accepted")
+	}
+}

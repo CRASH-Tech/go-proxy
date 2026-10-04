@@ -297,7 +297,10 @@ function renderPeers() {
           `${l.direction === 'out' ? 'outbound' : 'inbound'}, ${ago(l.since)}`)));
     }
 
-    const routes = h('td', {}, h('div', { class: 'routes' },
+    const iface = p.interface ? h('div', { class: 'iface' },
+      'dev ', h('code', { text: p.interface }),
+      !p.disabled && !p.interface_up ? h('span', { class: 'status-err', title: 'see the node log' }, ' not created') : null) : null;
+    const routes = h('td', {}, iface, h('div', { class: 'routes', title: p.interface ? 'accepted source addresses' : null },
       p.ip ? h('code', { title: 'assigned tunnel IP' }, `${p.ip} (IP)`) : null,
       (p.routes || []).map((r) => h('code', { text: r }))));
 
@@ -445,6 +448,13 @@ const routeChips = netChips(field('routes'));
 let editing = null;      // name of the peer being edited; null for a new one
 let generatedKey = null; // key pair generated in the open form
 
+// With an interface of its own, the peer's routes only filter its sources.
+function syncInterfaceFields() {
+  $('#routes-help').textContent = field('interface').value.trim()
+    ? 'Accepted as source addresses from the peer. Traffic to the peer is whatever the host routes into the interface.'
+    : 'Routed to the peer and accepted as source addresses from it. Longest prefix wins.';
+}
+
 function syncTLSFields() {
   const t = field('transport').value || state.node.transport;
   document.querySelectorAll('.tls-only').forEach((el) => { el.hidden = t !== 'tls'; });
@@ -463,6 +473,7 @@ function openPeer(name) {
   if (raw) {
     field('name').value = raw.name;
     field('endpoint').value = raw.endpoint || '';
+    field('interface').value = raw.interface || '';
     field('transport').value = raw.transport || '';
     field('psk').value = raw.psk || '';
     field('sni').value = (raw.tls && raw.tls.sni) || '';
@@ -474,12 +485,14 @@ function openPeer(name) {
     field('keepalive_saved').value = raw.keepalive || '';
   }
   syncTLSFields();
+  syncInterfaceFields();
   $('#peer-dialog').showModal();
   field('name').focus();
 }
 
 $('#add-peer').addEventListener('click', () => openPeer(null));
 field('transport').addEventListener('change', syncTLSFields);
+field('interface').addEventListener('input', syncInterfaceFields);
 
 $('#gen-keypair').addEventListener('click', async () => {
   try {
@@ -514,6 +527,7 @@ $('#peer-form').addEventListener('submit', async (e) => {
     routes: splitList(field('routes').value),
     ip: field('ip').value.trim(),
     endpoint: field('endpoint').value.trim(),
+    interface: field('interface').value.trim(),
     nat: field('nat').checked,
     disabled: !field('enabled').checked,
     transport: field('transport').value,

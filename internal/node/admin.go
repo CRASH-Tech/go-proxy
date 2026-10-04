@@ -37,8 +37,9 @@ type Info struct {
 // (none while it is disabled).
 type PeerInfo struct {
 	config.Peer
-	Source string     `json:"source"` // "env" (read-only) or "file"
-	Links  []LinkInfo `json:"links"`
+	Source      string     `json:"source"`                 // "env" (read-only) or "file"
+	InterfaceUp bool       `json:"interface_up,omitempty"` // its own TUN exists
+	Links       []LinkInfo `json:"links"`
 }
 
 // LinkInfo describes one established session with a peer.
@@ -98,7 +99,7 @@ func (n *Node) Peers() []PeerInfo {
 			out = append(out, PeerInfo{Peer: s.cfg, Source: s.source, Links: []LinkInfo{}})
 			continue
 		}
-		pi := PeerInfo{Peer: *p.conf(), Source: p.source, Links: []LinkInfo{}}
+		pi := PeerInfo{Peer: *p.conf(), Source: p.source, InterfaceUp: p.device() != nil, Links: []LinkInfo{}}
 		p.mu.Lock()
 		links := []*link{p.out, p.in}
 		p.mu.Unlock()

@@ -297,8 +297,16 @@ peers (one or more):
   GOPROXY_PEER_<NAME>_KEEPALIVE    cover/keepalive seconds (default: GOPROXY_KEEPALIVE, 25)
   GOPROXY_PEER_<NAME>_DISABLED     true: keep the peer configured but unused; its
                                    routes may then repeat an enabled peer's
+  GOPROXY_PEER_<NAME>_INTERFACE    create a TUN of the peer's own with this name
+                                   (up to 15 chars): whatever the host routes
+                                   into it goes to the peer, and the peer's
+                                   traffic comes out of it. _ROUTES then only
+                                   limit its source addresses, stay out of the
+                                   node TUN and GOPROXY_PUSH_ROUTES, and may
+                                   repeat another such peer's
 
-  Each peer needs _ROUTES and/or _IP; a prefix may belong to one peer only.
+  Each peer needs _ROUTES and/or _IP; a prefix may belong to one peer only
+  (peers with an _INTERFACE excepted).
   Every packet entering the TUN goes to the peer with the longest matching
   route; packets matching none (and all IPv6) are BLOCKED (answered with ICMP
   "administratively prohibited"). The node changes no sysctls or iptables,
